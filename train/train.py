@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from transformers import AutoModel
 from transformers import AutoTokenizer
 from transformers import BitsAndBytesConfig
+from transformers.trainer_utils import get_last_checkpoint
 from trl import ModelConfig
 from trl import TrlParser
 
@@ -258,6 +259,10 @@ def main(grpo_config, model_config):
                 print(
                     f"=== Auto-resume: found {latest}, downloaded to {resume_from} ==="
                 )
+        else:
+            resume_from = get_last_checkpoint(output_dir)
+            if resume_from:
+                print(f"=== Auto-resume: resuming from {resume_from} ===")
 
         trainer = Trainer(
             args=grpo_config,
