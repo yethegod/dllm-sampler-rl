@@ -99,6 +99,17 @@ class Trainer(GRPOTrainer):
             "gradient_accumulation_steps must be 1 (current buffering does not support gradient accumulation)"
         )
 
+        # The buffering in _prepare_inputs and the advantage process_slice both
+        # assume each dataloader batch is exactly per_device_train_batch_size,
+        # i.e. generation_batch_size == per_device_train_batch_size * num_processes.
+        # TRL silently sets steps_per_generation > 1 otherwise, which misaligns them.
+        assert self.args.steps_per_generation == 1, (
+            f"steps_per_generation must be 1, got {self.args.steps_per_generation}. "
+            f"Set generation_batch_size ({self.args.generation_batch_size}) equal to "
+            f"per_device_train_batch_size * num_processes "
+            f"({self.args.per_device_train_batch_size} * {self.accelerator.num_processes})."
+        )
+
         # Track recent rewards for best checkpoint saving
         self.train_reward_queue = deque(
             maxlen=10 * self.args.gradient_accumulation_steps
