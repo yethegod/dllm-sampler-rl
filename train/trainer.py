@@ -123,6 +123,22 @@ class Trainer(GRPOTrainer):
                 self.s3_callback = callback
                 break
 
+    def _inner_training_loop(self, batch_size=None, *args, **kwargs):
+        # On resume, transformers restores _train_batch_size from the
+        # checkpoint's trainer_state.json (auto_find_batch_size support). When
+        # per_device_train_batch_size changes across resumes (e.g. 8-GPU -> 4-GPU),
+        # the restored value shrinks the dataloader batches while the advantage
+        # process_slice still uses args, tripping the group-size assert in
+        # compute_loss. Always train with the batch size from args.
+        if batch_size is not None and batch_size != self.args.train_batch_size:
+            print(
+                f"Ignoring checkpoint-restored train batch size {batch_size}; "
+                f"using {self.args.train_batch_size} from args"
+            )
+            batch_size = self.args.train_batch_size
+            self._train_batch_size = batch_size
+        return super()._inner_training_loop(batch_size, *args, **kwargs)
+
     def train(self, *args, **kwargs):
         """Override train to save final checkpoint at end of training."""
         output = super().train(*args, **kwargs)

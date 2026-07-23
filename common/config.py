@@ -31,6 +31,15 @@ class Config(GRPOConfig):
                         f"loglikelihood_dtype = {self.loglikelihood_dtype} is not a valid floating-point torch dtype"
                     )
 
+    def to_dict(self):
+        # __post_init__ turns loglikelihood_dtype into a torch.dtype, which is
+        # not JSON-serializable. Stringify it so to_json_string() (used by the
+        # TensorBoard callback on_train_begin) doesn't crash.
+        d = super().to_dict()
+        if isinstance(d.get("loglikelihood_dtype"), torch.dtype):
+            d["loglikelihood_dtype"] = str(d["loglikelihood_dtype"])
+        return d
+
     # Parameters that control the data preprocessing
     max_prompt_length: Optional[int] = field(
         default=256,

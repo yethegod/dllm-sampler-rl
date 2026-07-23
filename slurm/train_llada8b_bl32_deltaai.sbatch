@@ -9,7 +9,7 @@
 #SBATCH --time=25:00:00
 #SBATCH --job-name=llada8b-bl32-gh200
 #SBATCH --output=slurm/logs/%x_%j.out
-#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT,REQUEUE
 #SBATCH --mail-user=sun01024@umn.edu
 
 set -euo pipefail

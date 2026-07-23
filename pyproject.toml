@@ -31,7 +31,9 @@ dependencies = [
   "pandas",
   "s3fs",
   "matplotlib",
-  "bitsandbytes==0.45.3; platform_system != 'Darwin'",
+  "bitsandbytes==0.45.3; platform_system != 'Darwin' and platform_machine != 'aarch64'",
+  # bitsandbytes has no aarch64 wheels before 0.46.0 (needed for GH200/DeltaAI)
+  "bitsandbytes>=0.46.0; platform_system != 'Darwin' and platform_machine == 'aarch64'",
 ]
 
 [tool.setuptools.packages.find]
