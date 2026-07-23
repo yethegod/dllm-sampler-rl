@@ -28,6 +28,8 @@ class EvalConfig:
     model_path: str
     save_path: str
     n_test: int | None
+    adaptive_block: bool = False
+    delimiter_threshold: float = 0.3
 
 
 def get_s3() -> s3fs.S3FileSystem:
@@ -119,6 +121,8 @@ def run_eval(
         )
         if cfg.sampling_mode:
             output_dir = Path(f"{output_dir}_sampling_mode_{cfg.sampling_mode}")
+        if cfg.adaptive_block:
+            output_dir = Path(f"{output_dir}_ada{cfg.delimiter_threshold}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -155,6 +159,10 @@ def run_eval(
             cmd.extend(["--gen_length", str(cfg.gen_length)])
         if cfg.n_test:
             cmd.extend(["--n_test", str(cfg.n_test)])
+        if cfg.adaptive_block:
+            cmd.extend(
+                ["--adaptive_block", "--delimiter_threshold", str(cfg.delimiter_threshold)]
+            )
 
         print(f"  Eval: {ckpt} seed={seed} temp={temp} {dataset}")
         result = subprocess.run(cmd, cwd=script_dir.parent)
@@ -244,6 +252,8 @@ def main():
     parser.add_argument("--model_path", default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--save_path", default="./eval_results")
     parser.add_argument("--n_test", type=int, default=None)
+    parser.add_argument("--adaptive_block", action="store_true")
+    parser.add_argument("--delimiter_threshold", type=float, default=0.3)
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
 
@@ -274,6 +284,8 @@ def main():
             model_path=args.model_path,
             save_path=args.save_path,
             n_test=args.n_test,
+            adaptive_block=args.adaptive_block,
+            delimiter_threshold=args.delimiter_threshold,
         )
         try:
             run_names.append(run_pipeline(cfg))
@@ -281,13 +293,17 @@ def main():
             print(f"Warning: Run {Path(run_path).name} failed: {e}")
             failed_runs.append(Path(run_path).name)
 
-    if not args.no_aggregate:
-        print("\nAggregating results...")
-        aggregate(args.save_path)
-
     print(f"\nDone. Evaluated {len(run_names)} run(s).")
     if failed_runs:
         print(f"Failed runs: {failed_runs}")
+        raise RuntimeError(
+            f"Evaluation failed for {len(failed_runs)} run(s): "
+            + ", ".join(failed_runs)
+        )
+
+    if not args.no_aggregate:
+        print("\nAggregating results...")
+        aggregate(args.save_path)
 
 
 if __name__ == "__main__":

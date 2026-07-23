@@ -21,6 +21,7 @@ class GenerationResult(NamedTuple):
     sampling_masks: torch.Tensor | None = None  # (B, T, BL)
     policy_inputs: tuple[torch.Tensor, ...] | None = None
     still_masked: torch.Tensor | None = None  # (B,)
+    block_sizes: list[int] | None = None  # Adaptive block sizes (adaptive_block only)
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -51,6 +52,9 @@ def generate_unified(
     temperature_policy: float = 1.0,
     full_context: bool = False,
     confidences_top_p: int = 1,
+    adaptive_block: bool = False,
+    delimiter_ids: tuple[int, ...] = (198,),
+    delimiter_threshold: float = 0.3,
 ) -> GenerationResult:
     if remasking == "policy":
         if policy is None:
@@ -63,6 +67,19 @@ def generate_unified(
             raise ValueError(f"steps must be provided for remasking='{remasking}'")
     else:
         raise ValueError(f"Unknown remasking strategy: {remasking}")
+
+    if adaptive_block:
+        if remasking not in ["policy", "fastdllm"]:
+            raise ValueError(
+                f"adaptive_block is not supported with remasking='{remasking}'"
+            )
+        if prompt.shape[0] != 1:
+            raise ValueError("adaptive_block requires batch size 1")
+        if remasking == "policy" and not full_context:
+            raise ValueError(
+                "adaptive_block with remasking='policy' requires full_context=True "
+                "(block-local policy inputs have variable shapes across blocks)"
+            )
 
     B, prompt_L = prompt.shape
     L = gen_length
@@ -102,108 +119,178 @@ def generate_unified(
             else policy.policy_type
         )
 
-    for num_block in range(num_blocks):
-        start_idx = num_block * block_length
-        end_idx = start_idx + block_length
-        block_slice = slice(start_idx, end_idx)
-        block_index = torch.zeros(L, dtype=torch.bool, device=x.device)
-        block_index[start_idx:end_idx] = True
+    def _forward_logits():
+        model_output = model(
+            x,
+            attention_mask=_attn_mask,
+            output_hidden_states=(policy_type == "dit_hidden"),
+        )
 
-        for _ in range(block_length):
-            generation_part = x[:, prompt_L:]
-            mask_index = (generation_part == mask_id) & (
-                steps_taken < max_steps
-            ).unsqueeze(-1)
-            block_mask_index = mask_index[:, block_index]  # (B, BL)
+        # Handle Dream model logit shifting
+        # Dream: logits at position i predict token i+1
+        # For generated tokens at [P, P+1, ..., P+L-1], we need logits at [P-1, P, ..., P+L-2]
+        if model_type == "Dream":
+            logits = model_output.logits[
+                :, prompt_L - 1 : -1
+            ]  # Include last prompt pos, exclude last gen pos
+        else:
+            logits = model_output.logits[
+                :, prompt_L:
+            ]  # Just slice to generation portion
 
-            if (~block_mask_index).all():
-                break
+        # Apply Gumbel noise
+        logits_with_noise = add_gumbel_noise(logits, temperature)
+        x0 = torch.argmax(logits_with_noise, dim=-1)
 
-            model_output = model(
-                x,
-                attention_mask=_attn_mask,
-                output_hidden_states=(policy_type == "dit_hidden"),
+        # Compute softmax once (needed by all strategies)
+        probs = F.softmax(logits, dim=-1)
+
+        return model_output, probs, x0
+
+    def _step_decision(
+        mask_index, block_mask_index, block_slice, model_output, probs, x0
+    ):
+        # Get unmask decisions based on strategy
+        if remasking == "policy":
+            unmask, sampling_data = _policy_unmask_decisions(
+                mask_index,
+                block_mask_index,
+                probs,
+                x0,
+                steps_taken,
+                block_slice,
+                L,
+                policy,
+                policy_type,
+                sampling_mode,
+                full_context,
+                confidences_top_p,
+                model_output,
+                prompt_L,
+                dpls_stop_logit,
+                temperature_policy,
             )
+            sampling_history.append(sampling_data)
 
-            # Handle Dream model logit shifting
-            # Dream: logits at position i predict token i+1
-            # For generated tokens at [P, P+1, ..., P+L-1], we need logits at [P-1, P, ..., P+L-2]
-            if model_type == "Dream":
-                logits = model_output.logits[
-                    :, prompt_L - 1 : -1
-                ]  # Include last prompt pos, exclude last gen pos
-            else:
-                logits = model_output.logits[
-                    :, prompt_L:
-                ]  # Just slice to generation portion
-
-            # Apply Gumbel noise
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-
-            # Compute softmax once (needed by all strategies)
-            probs = F.softmax(logits, dim=-1)
-
-            # Get unmask decisions based on strategy
-            if remasking == "policy":
-                unmask, sampling_data = _policy_unmask_decisions(
+        elif remasking == "fastdllm":
+            unmask = _confidence_threshold_unmask(
+                block_mask_index, probs, block_slice, thres
+            )
+            if policy is not None:
+                sampling_data = _record_policy_data(
                     mask_index,
                     block_mask_index,
                     probs,
-                    x0,
                     steps_taken,
                     block_slice,
                     L,
                     policy,
                     policy_type,
-                    sampling_mode,
                     full_context,
                     confidences_top_p,
                     model_output,
                     prompt_L,
-                    dpls_stop_logit,
                     temperature_policy,
+                    unmask,
                 )
                 sampling_history.append(sampling_data)
 
-            elif remasking == "fastdllm":
-                unmask = _confidence_threshold_unmask(
-                    block_mask_index, probs, block_slice, thres
-                )
-                if policy is not None:
-                    sampling_data = _record_policy_data(
-                        mask_index,
-                        block_mask_index,
-                        probs,
-                        steps_taken,
-                        block_slice,
-                        L,
-                        policy,
-                        policy_type,
-                        full_context,
-                        confidences_top_p,
-                        model_output,
-                        prompt_L,
-                        temperature_policy,
-                        unmask,
-                    )
-                    sampling_history.append(sampling_data)
+        else:  # low_confidence / random
+            unmask = _fixed_step_unmask_decisions(
+                block_mask_index,
+                probs,
+                x0,
+                block_slice,
+                tokens_per_step,
+                remasking,
+            )
 
-            elif remasking in ["low_confidence", "random"]:
-                unmask = _fixed_step_unmask_decisions(
-                    block_mask_index,
-                    probs,
-                    x0,
-                    block_slice,
-                    tokens_per_step,
-                    remasking,
+        return unmask
+
+    block_sizes = None
+    if not adaptive_block:
+        for num_block in range(num_blocks):
+            start_idx = num_block * block_length
+            end_idx = start_idx + block_length
+            block_slice = slice(start_idx, end_idx)
+            block_index = torch.zeros(L, dtype=torch.bool, device=x.device)
+            block_index[start_idx:end_idx] = True
+
+            for _ in range(block_length):
+                generation_part = x[:, prompt_L:]
+                mask_index = (generation_part == mask_id) & (
+                    steps_taken < max_steps
+                ).unsqueeze(-1)
+                block_mask_index = mask_index[:, block_index]  # (B, BL)
+
+                if (~block_mask_index).all():
+                    break
+
+                model_output, probs, x0 = _forward_logits()
+                unmask = _step_decision(
+                    mask_index, block_mask_index, block_slice, model_output, probs, x0
                 )
 
-            # Apply unmasking
+                # Apply unmasking
+                x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+
+                # Update steps taken: only count steps for batch elements that had work to do
+                steps_taken += block_mask_index.any(dim=-1).int()
+    else:
+        # AdaBlock-style adaptive block boundaries (arXiv:2509.26432): the first
+        # forward of each block doubles as the boundary decision, so it costs no
+        # extra NFE compared to fixed-block decoding.
+        block_sizes = []
+        start_idx = 0
+        while start_idx < L:
+            generation_part = x[:, prompt_L:]
+            mask_index = (generation_part == mask_id) & (
+                steps_taken < max_steps
+            ).unsqueeze(-1)
+            if not mask_index[:, start_idx:].any():
+                break
+
+            model_output, probs, x0 = _forward_logits()
+            block_len = _compute_adaptive_block_length(
+                x0,
+                probs,
+                start_idx,
+                L,
+                block_length,
+                delimiter_ids,
+                delimiter_threshold,
+            )
+            end_idx = start_idx + block_len
+            block_slice = slice(start_idx, end_idx)
+            block_index = torch.zeros(L, dtype=torch.bool, device=x.device)
+            block_index[start_idx:end_idx] = True
+            block_sizes.append(block_len)
+
+            block_mask_index = mask_index[:, block_index]
+            unmask = _step_decision(
+                mask_index, block_mask_index, block_slice, model_output, probs, x0
+            )
             x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
-
-            # Update steps taken: only count steps for batch elements that had work to do
             steps_taken += block_mask_index.any(dim=-1).int()
+
+            for _ in range(block_len - 1):
+                generation_part = x[:, prompt_L:]
+                mask_index = (generation_part == mask_id) & (
+                    steps_taken < max_steps
+                ).unsqueeze(-1)
+                block_mask_index = mask_index[:, block_index]
+
+                if (~block_mask_index).all():
+                    break
+
+                model_output, probs, x0 = _forward_logits()
+                unmask = _step_decision(
+                    mask_index, block_mask_index, block_slice, model_output, probs, x0
+                )
+                x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+                steps_taken += block_mask_index.any(dim=-1).int()
+
+            start_idx = end_idx
 
     # Prepare metadata for gradient steps/loss computation
     if record_policy_data:
@@ -237,12 +324,54 @@ def generate_unified(
             sampling_masks=sampling_masks,
             policy_inputs=policy_inputs_result,
             still_masked=still_masked,
+            block_sizes=block_sizes,
         )
     else:
         return GenerationResult(
             sequences=x,
             steps_taken=steps_taken,
+            block_sizes=block_sizes,
         )
+
+
+def _compute_adaptive_block_length(
+    x0: torch.Tensor,
+    probs: torch.Tensor,
+    gen_offset: int,
+    L: int,
+    default_block_length: int,
+    delimiter_ids: tuple[int, ...],
+    delimiter_threshold: float,
+) -> int:
+    """Compute the next block length following AdaBlock-dLLM (arXiv:2509.26432).
+
+    Looks at the argmax predictions in a window ahead of the generation frontier
+    and ends the block at the highest-confidence delimiter token if its confidence
+    exceeds delimiter_threshold; otherwise falls back to default_block_length.
+
+    :param x0: (1, L) argmax token predictions over the generation region
+    :param probs: (1, L, V) softmax probabilities over the generation region
+    :param gen_offset: start of the next block, relative to the generation region
+    :return: block length in [1, L - gen_offset]
+    """
+    remaining = L - gen_offset
+    window_size = min(int(0.25 * L), remaining)
+    window_tokens = x0[0, gen_offset : gen_offset + window_size]
+
+    delimiter_mask = torch.zeros_like(window_tokens, dtype=torch.bool)
+    for token_id in delimiter_ids:
+        delimiter_mask |= window_tokens == token_id
+
+    if not torch.any(delimiter_mask):
+        return min(default_block_length, remaining)
+
+    delimiter_pos = gen_offset + torch.nonzero(delimiter_mask).squeeze(-1)
+    delimiter_confidences = probs[0, delimiter_pos, x0[0, delimiter_pos]]
+    max_confidence, best_idx = torch.max(delimiter_confidences, dim=0)
+
+    if max_confidence.item() >= delimiter_threshold:
+        return int(delimiter_pos[best_idx].item()) - gen_offset + 1
+    return min(default_block_length, remaining)
 
 
 def _get_masks(

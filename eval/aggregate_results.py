@@ -183,7 +183,9 @@ def aggregate_results(results_dir):
                 "model_path": data.get("model_path", ""),
                 "remasking": data.get("remasking", ""),
                 "sampling_mode": data.get("sampling_mode", "bernoulli"),
-                "block_length": data.get("block_length", 32),
+                # str: adaptive-block runs record e.g. "ada0.3" here, and mixed
+                # int/str values break sorted() during grouping
+                "block_length": str(data.get("block_length", 32)),
                 "gen_length": data.get("gen_length", 256),
                 "expected_dataset_size": expected_size,
                 "actual_samples_processed": actual_size,

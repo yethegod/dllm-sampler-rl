@@ -82,6 +82,11 @@ def parse_baseline_checkpoint(name):
     if match := re.search(r"t([\d.]+)", name):
         params["thres"] = float(match.group(1))
 
+    # Extract ada<number> (adaptive block, AdaBlock delimiter threshold)
+    if match := re.search(r"ada([\d.]+)", name):
+        params["adaptive_block"] = True
+        params["delimiter_threshold"] = float(match.group(1))
+
     return params
 
 
@@ -105,6 +110,9 @@ def evaluate(
     confidences_top_p=1,
     mask_id=126336,
     model_type=None,
+    adaptive_block=False,
+    delimiter_ids=(198,),
+    delimiter_threshold=0.3,
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -152,6 +160,15 @@ def evaluate(
                 "attention_mask": attn_masks,
             }
 
+            if adaptive_block:
+                gen_kwargs.update(
+                    {
+                        "adaptive_block": True,
+                        "delimiter_ids": tuple(delimiter_ids),
+                        "delimiter_threshold": delimiter_threshold,
+                    }
+                )
+
             if remasking == "policy":
                 if policy is None:
                     raise ValueError(
@@ -185,6 +202,10 @@ def evaluate(
             generated_texts = tokenizer.batch_decode(
                 out[:, -gen_length:], skip_special_tokens=True
             )
+
+            avg_block_size = None
+            if result.block_sizes:
+                avg_block_size = sum(result.block_sizes) / len(result.block_sizes)
 
             batch_wall_time = time.time() - start_time
             wall_time_per_sample = batch_wall_time / len(generated_texts)
@@ -229,6 +250,8 @@ def evaluate(
                         if hasattr(steps_taken[j], "item")
                         else steps_taken[j],
                         "wall_time": wall_time_per_sample,
+                        "avg_block_size": avg_block_size,
+                        "block_sizes": result.block_sizes,
                     }
                     for j in range(len(task_ids))
                 ]
@@ -246,6 +269,8 @@ def evaluate(
                         if hasattr(steps_taken[j], "item")
                         else steps_taken[j],
                         "wall_time": wall_time_per_sample,
+                        "avg_block_size": avg_block_size,
+                        "block_sizes": result.block_sizes,
                     }
                     for j in range(len(gt_answers))
                 ]
@@ -438,7 +463,25 @@ if __name__ == "__main__":
         default=None,
         help="Sampling mode override (optional, uses config value if not specified)",
     )
+    parser.add_argument(
+        "--adaptive_block",
+        action="store_true",
+        help="Use AdaBlock-style adaptive block sizes (requires batch_size 1)",
+    )
+    parser.add_argument(
+        "--delimiter_threshold",
+        type=float,
+        default=0.3,
+        help="AdaBlock delimiter confidence threshold",
+    )
+    parser.add_argument(
+        "--delimiter_ids",
+        type=str,
+        default="198",
+        help="Comma-separated delimiter token ids for AdaBlock (198=newline)",
+    )
     args = parser.parse_args()
+    args.delimiter_ids = tuple(int(t) for t in args.delimiter_ids.split(","))
 
     init_seed(args.seed)
 
@@ -471,6 +514,9 @@ if __name__ == "__main__":
     if args.remasking == "fastdllm":
         assert args.thres is not None, "thres must be provided for fastdllm"
 
+    if args.adaptive_block:
+        assert args.batch_size == 1, "adaptive_block requires batch_size 1"
+
     # NOTE: setting up the accelerator must be done after parsing config
     accelerator = Accelerator()
 
@@ -483,6 +529,9 @@ if __name__ == "__main__":
             args.thres = baseline_params["thres"]
         if "diffusion_steps" in baseline_params:
             args.diffusion_steps = baseline_params["diffusion_steps"]
+        if baseline_params.get("adaptive_block"):
+            args.adaptive_block = True
+            args.delimiter_threshold = baseline_params["delimiter_threshold"]
 
         args.sampling_mode = None
         if args.remasking in {"random", "low_confidence"}:
@@ -620,6 +669,9 @@ if __name__ == "__main__":
         confidences_top_p=args.grpo_config.confidences_top_p
         if args.remasking == "policy"
         else 1,
+        adaptive_block=args.adaptive_block,
+        delimiter_ids=args.delimiter_ids,
+        delimiter_threshold=args.delimiter_threshold,
     )
 
     if accelerator.num_processes > 1:
@@ -635,6 +687,11 @@ if __name__ == "__main__":
         results["metrics"] = {
             k: results.pop(k) for k in ("wall_time", "total_processed")
         }
+        # Label adaptive-block runs distinctly so filenames and aggregation don't
+        # collide with fixed-block results (block_length only serves as the
+        # AdaBlock fallback length during generation, which is done by now)
+        if args.adaptive_block:
+            args.block_length = f"ada{args.delimiter_threshold}"
         results.update(
             {
                 "model_path": args.model_path,
@@ -645,12 +702,14 @@ if __name__ == "__main__":
                 "policy_path": args.policy_path,
                 "thres": args.thres,
                 "n_test": args.n_test,
+                "adaptive_block": args.adaptive_block,
+                "delimiter_threshold": args.delimiter_threshold
+                if args.adaptive_block
+                else None,
             }
         )
-        get_local_path_and_save_results(results, args, model_name)
-
-        # Before exiting, print some basic metrics about the test set to make sure we processed
-        # as many samples as we expected
+        # Verify and persist test-set coverage before saving so downstream
+        # aggregation can detect incomplete evaluations.
         actual_samples_processed = len(results["generations"])
         expected_dataset_size = len(dataset) if hasattr(dataset, "__len__") else None
         if hasattr(dataset, "dataset"):  # Handle Subset wrapper
@@ -659,6 +718,18 @@ if __name__ == "__main__":
             )
         elif args.n_test is not None:
             expected_dataset_size = args.n_test
+
+        coverage_complete = (
+            actual_samples_processed == expected_dataset_size
+            if expected_dataset_size is not None
+            else None
+        )
+        results["test_set_verification"] = {
+            "expected_dataset_size": expected_dataset_size,
+            "actual_samples_processed": actual_samples_processed,
+            "coverage_complete": coverage_complete,
+        }
+        get_local_path_and_save_results(results, args, model_name)
 
         print("\n=== Test Set Verification ===")
         print(f"Dataset: {args.dataset}")
