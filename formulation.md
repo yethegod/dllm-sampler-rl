@@ -27,8 +27,8 @@ what was measured rather than of what was assumed.
 ## 2. Empirical grounding
 
 Fast-dLLM constants on GSM8K (all 1319 questions), LLaDA-8B-Instruct, $L = 256$, greedy
-($T=0$), seed 42. 13 of the 15 grid cells; $\tau{=}0.5$ at $b\in\{64,128\}$ still queued.
-Source: `/work/hdd/bhta/zsun9/eval_results/blocksweep/summary_statistics.csv`.
+($T=0$), seed 42. Complete 5×3 grid. Source:
+`/work/hdd/bhta/zsun9/eval_results/blocksweep/summary_statistics.csv`.
 
 **accuracy % / NFE**
 
@@ -37,23 +37,28 @@ Source: `/work/hdd/bhta/zsun9/eval_results/blocksweep/summary_statistics.csv`.
 | 8   | 70.81 / 57.0 | 78.54 / 73.5 | 79.08 / 99.8 |
 | 16  | 69.67 / 44.2 | 78.39 / 59.7 | 79.68 / 88.1 |
 | 32  | 63.08 / 37.3 | 77.71 / 52.0 | 79.45 / 81.5 |
-| 64  | *(pending)*  | **79.61 / 47.2** | **80.67 / 78.0** |
-| 128 | *(pending)*  | 72.71 / 44.5 | 71.11 / 81.3 |
+| 64  | **65.81 / 32.6** | **79.61 / 47.2** | **80.67 / 78.0** |
+| 128 | 61.18 / 28.7 | 72.71 / 44.5 | 71.11 / 81.3 |
 
 Three facts drive every design choice below.
 
-**(a) At fixed $\tau$, block size buys no compute.** At $\tau = 0.9$, $b = 64$ *strictly
+**(a) At fixed $\tau$, block size buys almost no compute.** At $\tau = 0.9$, $b = 64$ *strictly
 dominates* all four other block sizes — highest accuracy **and** lowest NFE. There is no dial to
 turn. At $\tau = 0.7$, $b = 64$ dominates $b \in \{8,16,32\}$, leaving only $b = 128$ (6% cheaper,
-6.9 points worse). Only $\tau = 0.5$ shows a clean monotone trade-off, and that whole column is
-dominated by $\tau{=}0.7$, $b{=}64$.
+6.9 points worse). At $\tau = 0.5$, $b = 64$ again dominates $b = 32$ on both axes. The only
+genuine within-column trade-offs are $b \in \{8, 16, 64, 128\}$ at $\tau = 0.5$ — and that whole
+column is far below the frontier set by $\tau = 0.7$.
 
-**(b) Accuracy vs. block size is $\wedge$-shaped, peaking at 64 — not monotone.** Small blocks
-are both worse *and* slower. Likely mechanism: a block cannot advance until every position in it
-is filled, so small blocks force `argmax` unmasking of low-confidence positions
-(`common/generation/generation.py`, the `if not unmask_local.any()` fallback), whereas a large
-block lets the decoder spend its steps on confident positions elsewhere and revisit the hard
-ones with more context.
+**(b) Accuracy vs. block size is $\wedge$-shaped, peaking at 64 in every column — not
+monotone.** Small blocks are both worse *and* slower. Likely mechanism: a block cannot advance
+until every position in it is filled, so small blocks force `argmax` unmasking of low-confidence
+positions (`common/generation/generation.py`, the `if not unmask_local.any()` fallback), whereas
+a large block lets the decoder spend its steps on confident positions elsewhere and revisit the
+hard ones with more context.
+
+Note what this costs the action space: of the five block candidates, **$b = 8$ and $b = 32$ never
+appear on the global Pareto frontier at any $\tau$**. The policy's first job is simply to learn
+not to pick them.
 
 **(c) $\tau$ is the compute lever, roughly 2× stronger than $b$.** Within $\tau = 0.9$, NFE spans
 78–100 (28%). Across $\tau$ at $b = 64$, NFE spans 47–78 (65%), and $\tau = 0.5$ reaches 37.
@@ -64,12 +69,12 @@ Because every constant policy in the action space has been measured, the best *s
 policy is known exactly rather than guessed. Per-example
 $R_i = \mathbb{1}[\hat y_i = y_i]\cdot((L - \min(N_i,L) + 1)/L)^{\alpha}$:
 
-| $\alpha$ | best constant | $\mathbb{E}[R]$ |
-|---|---|---|
-| 0 | $(b{=}64,\ \tau{=}0.9)$ | 0.8067 |
-| 0.25 | $(b{=}64,\ \tau{=}0.7)$ | 0.7590 |
-| **0.5** | $(b{=}64,\ \tau{=}0.7)$ | **0.7238** |
-| 1.0 | $(b{=}64,\ \tau{=}0.7)$ | 0.6587 |
+| $\alpha$ | best constant | $\mathbb{E}[R]$ | per-example oracle |
+|---|---|---|---|
+| 0 | $(b{=}64,\ \tau{=}0.9)$ | 0.8067 | 0.9325 (+15.6%) |
+| 0.25 | $(b{=}64,\ \tau{=}0.7)$ | 0.7590 | 0.9032 (+19.0%) |
+| **0.5** | $(b{=}64,\ \tau{=}0.7)$ | **0.7238** | 0.8750 (+20.9%) |
+| 1.0 | $(b{=}64,\ \tau{=}0.7)$ | 0.6587 | 0.8218 (+24.7%) |
 
 **$b = 64$ is optimal at every $\alpha$; $\tau$ flips once near $\alpha \approx 0.083$ and then
 stays at 0.7.** Two consequences:
@@ -83,26 +88,26 @@ stays at 0.7.** Two consequences:
 
 ### 2.2 How much state-dependence is even available
 
-Since all 13 constants were run on the same questions with the same seed, per-example outcomes
+Since all 15 constants were run on the same questions with the same seed, per-example outcomes
 can be compared directly:
 
 | | |
 |---|---|
 | best constant $(64, 0.7)$ solves | **80.7%** |
-| at least one of the 13 actions solves | **92.9%** |
-| all 13 actions solve | 32.1% |
-| solved by some but not all ("disagreement band") | **60.9%** |
+| at least one of the 15 actions solves | **93.3%** |
+| all 15 actions solve | 23.3% |
+| solved by some but not all ("disagreement band") | **70.0%** |
 
-An oracle choosing the best action per example scores $\mathbb{E}[R] = 0.8587$ at $\alpha = 0.5$
-vs. 0.7238 for the best constant — **+18.6%**.
+An oracle choosing the best action per example scores $\mathbb{E}[R] = 0.8750$ at $\alpha = 0.5$
+vs. 0.7238 for the best constant — **+20.9%**.
 
 **This is a loose upper bound and must not be read as achievable headroom.** Decoding is
 deterministic at $T = 0$, so the flips are not sampling noise; they are chaotic sensitivity to
 the unmasking schedule — change the order slightly and the answer cascades elsewhere. Taking a
-max over 13 such binary outcomes harvests a large amount of variation that is unpredictable *in
+max over 15 such binary outcomes harvests a large amount of variation that is unpredictable *in
 principle* from the block-start state. The project's bet, stated precisely:
 
-> **Some non-trivial fraction of the 60.9% disagreement band is predictable from the confidence
+> **Some non-trivial fraction of the 70% disagreement band is predictable from the confidence
 > field observed at block boundaries.**
 
 Nothing cheaper than training answers this. §9 states what counts as a refutation.
