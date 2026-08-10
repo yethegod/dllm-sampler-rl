@@ -55,15 +55,20 @@ class PolicyHFWrapper(PreTrainedModel):
             elif hasattr(m, "gradient_checkpointing"):
                 setattr(m, "gradient_checkpointing", bool(value))
 
+    @staticmethod
+    def _coerce(v, dtype):
+        # Only floating-point tensors get cast. Integer tensors are indices
+        # (e.g. block_start) and bf16 cannot represent every integer up to the
+        # generation length exactly; bool tensors are masks that downstream code
+        # re-casts itself. Both must pass through untouched.
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            return v.to(dtype)
+        return v
+
     def forward(self, *args, **kwargs):
         # coerce dtypes if needed
-        args = tuple(
-            arg.to(self.dtype) if isinstance(arg, torch.Tensor) else arg for arg in args
-        )
-        kwargs = {
-            k: v.to(self.dtype) if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
+        args = tuple(self._coerce(arg, self.dtype) for arg in args)
+        kwargs = {k: self._coerce(v, self.dtype) for k, v in kwargs.items()}
         return self.base_policy(*args, **kwargs)
 
     def get_input_embeddings(self):
@@ -253,16 +258,21 @@ class DiTConfidencePolicy(nn.Module):
             # Initialize output_proj bias to target mean
             self.output_proj.bias.data.fill_(target_logit)
 
-    def forward(
+    def trunk(
         self,
         m: torch.Tensor,
         c: torch.Tensor,
         timestep: torch.Tensor,
     ) -> torch.Tensor:
-        """:param m: (*B,L) mask with 1=masked, 0=unmasked
+        """Shared backbone up to (and including) the final norm.
+
+        Split out of forward() so that heads other than output_proj can read the
+        per-position hidden states (see DiTBlockSizePolicy).
+
+        :param m: (*B,L) mask with 1=masked, 0=unmasked
         :param c: (*B,L,confidences_top_p) confidence values in [0,1]
         :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
-        :return: (*B,L) unmasking logits
+        :return: (*B,L,hidden_dim) normalized hidden states
         """
         *B, L, _ = c.shape
         assert m.shape == (*B, L)
@@ -292,8 +302,129 @@ class DiTConfidencePolicy(nn.Module):
             x_flat = block(x_flat, cond_flat)
         x = x_flat.view(original_shape)
 
-        # Predict logits
-        x = self.final_norm(x)
-        raw_logits = self.output_proj(x).squeeze(-1)
+        return self.final_norm(x)
 
-        return raw_logits
+    def forward(
+        self,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """:param m: (*B,L) mask with 1=masked, 0=unmasked
+        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
+        :return: (*B,L) unmasking logits
+        """
+        return self.output_proj(self.trunk(m, c, timestep)).squeeze(-1)
+
+
+class DiTBlockSizePolicy(DiTConfidencePolicy):
+    """Joint (block size, Fast-dLLM threshold) policy; see formulation.md.
+
+    Reuses DiTConfidencePolicy's trunk verbatim and adds two heads:
+
+    - block size: the parent's per-position output_proj is reinterpreted as a boundary
+      score, u[i] = "score of ending the current block just after position i". The logit
+      of candidate b is u[block_start + b - 1] plus a learnable per-candidate prior. Only
+      the K prior biases are new parameters.
+    - threshold: a pooled read of the trunk's hidden states over the lookahead window
+      [block_start, block_start + max_block), restricted to still-masked positions.
+
+    The two heads are conditionally independent given the state, so the joint log-prob is
+    the sum of the two. That cannot express couplings such as "large block => low
+    threshold"; see formulation.md 5.3 for why v1 accepts this.
+    """
+
+    def __init__(
+        self,
+        block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
+        thresholds: tuple[float, ...] = (0.5, 0.7, 0.9),
+        block_size_prior_logits: tuple[float, ...] | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        if len(block_size_candidates) == 0 or len(thresholds) == 0:
+            raise ValueError("block_size_candidates and thresholds must be non-empty")
+        if sorted(block_size_candidates) != list(block_size_candidates):
+            raise ValueError(
+                f"block_size_candidates must be ascending, got {block_size_candidates}"
+            )
+
+        self.register_buffer(
+            "block_size_candidates",
+            torch.tensor(block_size_candidates, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "thresholds",
+            torch.tensor(thresholds, dtype=torch.float32),
+            persistent=False,
+        )
+
+        # Per-candidate prior over block sizes. Zero => uniform at init, since
+        # smart_init makes every u[i] equal and hence every gathered score equal.
+        if block_size_prior_logits is None:
+            init_bias = torch.zeros(len(block_size_candidates))
+        else:
+            if len(block_size_prior_logits) != len(block_size_candidates):
+                raise ValueError(
+                    f"block_size_prior_logits has {len(block_size_prior_logits)} entries "
+                    f"but there are {len(block_size_candidates)} candidates"
+                )
+            init_bias = torch.tensor(block_size_prior_logits, dtype=torch.float32)
+        self.block_size_bias = nn.Parameter(init_bias)
+
+        # Zero-init so the threshold distribution also starts uniform. Note this must
+        # happen here rather than in apply_smart_init, which the parent __init__ calls
+        # before this head exists.
+        self.threshold_head = nn.Linear(self.hidden_dim, len(thresholds))
+        with torch.no_grad():
+            self.threshold_head.weight.data.zero_()
+            self.threshold_head.bias.data.zero_()
+
+    def forward(
+        self,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        timestep: torch.Tensor,
+        block_start: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """:param m: (*B,L) mask with 1=masked, 0=unmasked
+        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
+        :param block_start: (*B,1) integer index of the current block's first position
+        :return: ((*B,K_block) block-size logits, (*B,K_thres) threshold logits)
+        """
+        *B, L, _ = c.shape
+        assert block_start.shape == (*B, 1), (
+            f"Unexpected {block_start.shape=}; batch dim(s) {B=}"
+        )
+
+        h = self.trunk(m, c, timestep)  # (*B, L, H)
+        u = self.output_proj(h).squeeze(-1)  # (*B, L)
+
+        start = block_start.long()  # (*B, 1)
+
+        ### Block-size head: gather the boundary score of each candidate
+        end = start + self.block_size_candidates  # (*B, K)
+        feasible = end <= L
+        # Defensive: the multiple-of-8 tiling invariant means the smallest candidate
+        # always fits, but an all-infeasible row would make softmax produce NaN.
+        no_feasible = ~feasible.any(dim=-1, keepdim=True)
+        smallest = torch.zeros_like(feasible)
+        smallest[..., 0] = True
+        feasible = feasible | (no_feasible & smallest)
+
+        block_logits = u.gather(-1, (end - 1).clamp(max=L - 1)) + self.block_size_bias
+        block_logits = block_logits.masked_fill(~feasible, float("-inf"))
+
+        ### Threshold head: masked mean-pool over the lookahead window
+        max_block = int(self.block_size_candidates[-1].item())
+        pos = torch.arange(L, device=h.device).expand(*B, L)  # (*B, L)
+        in_window = (pos >= start) & (pos < start + max_block)  # (*B, L)
+        weights = (in_window & m.bool()).to(h.dtype).unsqueeze(-1)  # (*B, L, 1)
+        pooled = (h * weights).sum(dim=-2) / weights.sum(dim=-2).clamp(min=1.0)
+        threshold_logits = self.threshold_head(pooled)  # (*B, K_thres)
+
+        return block_logits, threshold_logits

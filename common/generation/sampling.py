@@ -341,3 +341,84 @@ def dpls_batch_loglik(
     total_loglik = loglik_stage1 + loglik_stage2  # (*B,)
 
     return total_loglik
+
+
+def categorical_sample(
+    logits: torch.Tensor,
+    feasible_mask: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Sample one action index per batch item from a categorical distribution.
+
+    Used by the joint (block size, threshold) policy, where each decision picks one
+    element of a small candidate set rather than a subset of positions.
+
+    :param logits: (*B, K) action logits
+    :param feasible_mask: (*B, K) bool, True where the action is selectable; None = all
+    :param dtype: if not None, sampling will be done in this dtype
+    :return: (*B,) long action indices
+    """
+    if dtype is not None:
+        logits = logits.to(dtype=dtype)
+    if feasible_mask is not None:
+        logits = logits.masked_fill(~feasible_mask, float("-inf"))
+
+    # multinomial only accepts 1D/2D, so flatten the leading batch dims
+    probs = torch.softmax(logits.float(), dim=-1)
+    samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).squeeze(-1)
+    return samples.view(logits.shape[:-1])
+
+
+def categorical_batch_loglik(
+    samples: torch.Tensor,
+    logits: torch.Tensor,
+    action_mask: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Log-likelihood of a categorical draw.
+
+    :param samples: (*B,) long action indices
+    :param logits: (*B, K) action logits
+    :param action_mask: (*B,) bool, False for padded timesteps (contribute 0)
+    :param dtype: if not None, computation will be in this dtype
+    :return: (*B,) log-likelihood per batch item
+    """
+    if samples.shape != logits.shape[:-1]:
+        raise ValueError(
+            f"Shape mismatch: samples {samples.shape} vs logits {logits.shape}"
+        )
+    if dtype is not None:
+        logits = logits.to(dtype=dtype)
+
+    log_probs = torch.log_softmax(logits, dim=-1)  # (*B, K)
+    ll = log_probs.gather(-1, samples.long().unsqueeze(-1)).squeeze(-1)  # (*B,)
+
+    if action_mask is not None:
+        # Padded timesteps must contribute exactly 0, so zero them *before* they can
+        # poison the sum (a -inf gathered from an infeasible padded slot would give NaN).
+        ll = torch.where(action_mask.bool(), ll, torch.zeros_like(ll))
+
+    return ll
+
+
+def categorical_entropy(
+    logits: torch.Tensor,
+    feasible_mask: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Entropy of a categorical distribution, for collapse monitoring.
+
+    :param logits: (*B, K) action logits
+    :param feasible_mask: (*B, K) bool, True where the action is selectable; None = all
+    :param dtype: if not None, computation will be in this dtype
+    :return: (*B,) entropy in nats
+    """
+    if dtype is not None:
+        logits = logits.to(dtype=dtype)
+    if feasible_mask is not None:
+        logits = logits.masked_fill(~feasible_mask, float("-inf"))
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    # xlogy gives 0 for p=0 instead of the 0 * -inf = NaN that p * log_p would produce
+    return -torch.xlogy(probs, probs).sum(dim=-1)

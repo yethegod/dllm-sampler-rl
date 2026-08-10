@@ -23,6 +23,7 @@ from trl import TrlParser
 import train.reward_func as reward_func
 from common.config import Config
 from common.models.policy import DiTHiddenStatePolicy
+from common.models.policy import DiTBlockSizePolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from common.s3 import S3UploadCallback
@@ -84,10 +85,31 @@ MASK_TOKENS_MAP = {"LLaDA": 126336, "Dream": 151666}
 def main(grpo_config, model_config):
     set_random_seed(grpo_config.seed)
 
-    # During training, remasking must always be "policy"
-    assert grpo_config.remasking == "policy", (
-        f"Training only supports remasking='policy', got '{grpo_config.remasking}'"
+    # During training, remasking must be a learned strategy: "policy" learns which
+    # positions to unmask at a fixed schedule, "block_policy" learns the schedule
+    # itself (block size + threshold) and decodes within a block with Fast-dLLM.
+    assert grpo_config.remasking in ("policy", "block_policy"), (
+        f"Training only supports remasking in ('policy', 'block_policy'), "
+        f"got '{grpo_config.remasking}'"
     )
+    if grpo_config.remasking == "block_policy":
+        assert grpo_config.policy_type == "dit_block_size", (
+            f"remasking='block_policy' requires policy_type='dit_block_size', "
+            f"got '{grpo_config.policy_type}'"
+        )
+        assert grpo_config.sampling_mode == "categorical", (
+            f"remasking='block_policy' requires sampling_mode='categorical', "
+            f"got '{grpo_config.sampling_mode}'"
+        )
+        assert grpo_config.policy_full_context, (
+            "remasking='block_policy' requires policy_full_context=True: the policy "
+            "scores boundaries across the whole generation region, not just one block"
+        )
+        assert not grpo_config.es_thresholds, (
+            "Expert steering is not supported with remasking='block_policy': the ES "
+            "expert is a fixed-threshold Fast-dLLM rollout, which produces no "
+            "(block size, threshold) actions for the policy to imitate"
+        )
 
     assert grpo_config.per_device_train_batch_size % grpo_config.num_generations == 0, (
         f"per_device_train_batch_size ({grpo_config.per_device_train_batch_size}) must be "
@@ -202,10 +224,32 @@ def main(grpo_config, model_config):
             num_blocks=grpo_config.policy_num_blocks,
             time_period=grpo_config.policy_time_period,
         ).to(device)
+    elif grpo_config.policy_type == "dit_block_size":
+        hidden_dim = grpo_config.policy_hidden_dim or 128
+        feedforward_dim = grpo_config.policy_feedforward_dim or (4 * hidden_dim)
+
+        policy_core = DiTBlockSizePolicy(
+            block_size_candidates=tuple(grpo_config.block_size_candidates),
+            thresholds=tuple(grpo_config.threshold_candidates),
+            block_size_prior_logits=(
+                tuple(grpo_config.block_size_prior_logits)
+                if grpo_config.block_size_prior_logits is not None
+                else None
+            ),
+            hidden_dim=hidden_dim,
+            feedforward_dim=feedforward_dim,
+            num_heads=grpo_config.policy_num_heads,
+            dropout=grpo_config.policy_dropout,
+            time_embed_dim=grpo_config.policy_time_embed_dim,
+            smart_init=grpo_config.policy_smart_init,
+            confidences_top_p=grpo_config.confidences_top_p,
+            num_blocks=grpo_config.policy_num_blocks,
+            time_period=grpo_config.policy_time_period,
+        ).to(device)
     else:
         raise ValueError(
             f"Policy type {grpo_config.policy_type} not supported. "
-            "Choose from ['dit_hidden', 'dit_confidence']"
+            "Choose from ['dit_hidden', 'dit_confidence', 'dit_block_size']"
         )
 
     policy = PolicyHFWrapper(policy_core, grpo_config.policy_type)

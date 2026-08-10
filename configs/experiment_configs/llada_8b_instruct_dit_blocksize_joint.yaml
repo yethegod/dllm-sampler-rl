@@ -1,0 +1,100 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Joint (block size, Fast-dLLM threshold) policy -- see formulation.md.
+# Derived from llada_8b_instruct_dit_confidence_BL32_mixture.yaml; only the
+# policy/action/reward settings differ, everything else is kept identical so the
+# comparison against the existing runs stays clean.
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# 16 rather than the usual 8: the joint action space has only 15 elements and a
+# rollout makes 2-32 decisions against a single scalar reward, so gradient
+# variance per decision is much higher than in the per-position setting
+# (formulation.md 7). One group per GPU; 16 x 8 GPUs = generation_batch_size.
+num_generations: 16
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_policy (the policy picks the block length per block);
+# kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# The compute term must be non-zero here. At alpha=0 the best action is simply the
+# most accurate one, (b=64, tau=0.9), and the policy has nothing to trade off.
+# Measured best-constant baselines (GSM8K, per-example E[R]): alpha=0 -> 0.8067 at
+# (64, 0.9); alpha=0.5 -> 0.7238 at (64, 0.7). Beating 0.7238 is the bar.
+alpha_compute_reward: 0.5
+
+# Policy specific
+policy_type: dit_block_size
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -2.0
+sampling_mode: categorical
+
+# Joint action space: 5 block sizes x 3 thresholds = 15 actions. Every one of
+# these has a measured constant-policy baseline from the Phase 0 sweep, which is
+# what makes "beat the best constant" an exact test (formulation.md 2.1).
+block_size_candidates: [8, 16, 32, 64, 128]
+threshold_candidates: [0.5, 0.7, 0.9]

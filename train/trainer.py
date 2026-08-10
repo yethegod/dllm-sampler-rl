@@ -34,6 +34,8 @@ from trl.trainer.utils import print_prompt_completions_sample
 
 from common.generation.generation import generate_unified
 from common.generation.sampling import bernoulli_batch_loglik
+from common.generation.sampling import categorical_batch_loglik
+from common.generation.sampling import categorical_entropy
 from common.generation.sampling import dpls_batch_loglik
 from common.s3 import S3UploadCallback
 
@@ -398,8 +400,19 @@ class Trainer(GRPOTrainer):
         with torch.amp.autocast("cuda", enabled=self.args.fp16):
             logits = model(*policy_inputs)  # (B, T, BL)
 
+        if sampling_mode == "categorical":
+            # The block-size policy returns the two heads separately; concatenate them
+            # into the same layout the rollout recorded so one code path handles both.
+            logits = torch.cat(logits, dim=-1)  # (B, T, K_block + K_thres)
+
         # Calculate corresponding log-likelihoods under the model
-        if sampling_mode == "dpls":
+        if sampling_mode == "categorical":
+            lls = self._categorical_joint_loglik(
+                samples=samples,
+                logits=logits,
+                sampling_masks=sampling_masks,
+            )
+        elif sampling_mode == "dpls":
             lls = dpls_batch_loglik(
                 samples=samples,
                 utilities=logits,
@@ -420,7 +433,17 @@ class Trainer(GRPOTrainer):
         # Compute entropy if requested
         entropy = None
         if return_entropy:
-            if sampling_mode in ["bernoulli", "bernoulli-argmax"]:
+            if sampling_mode == "categorical":
+                # Joint entropy of two independent categoricals is the sum. Averaged
+                # over real decisions only -- this is the primary collapse signal
+                # (formulation.md 9), so padded slots must not dilute it.
+                block_logits, thres_logits = self._split_joint_logits(logits)
+                joint = categorical_entropy(
+                    block_logits, feasible_mask=torch.isfinite(block_logits)
+                ) + categorical_entropy(thres_logits)
+                active_mask = sampling_masks[..., 0].float()
+                entropy = (joint * active_mask).sum() / active_mask.sum().clamp(min=1)
+            elif sampling_mode in ["bernoulli", "bernoulli-argmax"]:
                 # For Bernoulli: H = -p*log(p) - (1-p)*log(1-p)
                 probs_clamped = torch.sigmoid(logits).clamp(1e-8, 1 - 1e-8)
                 entropy = -(
@@ -445,13 +468,61 @@ class Trainer(GRPOTrainer):
             return lls, entropy
         return lls
 
+    def _split_joint_logits(self, logits: torch.Tensor):
+        """Split the concatenated (block size, threshold) head logits.
+
+        Both heads share one tensor so that the generic time-axis slicing in
+        compute_loss works unchanged; they are split back here.
+
+        :param logits: (..., K_block + K_thres)
+        :return: ((..., K_block), (..., K_thres))
+        """
+        n_block = len(self.args.block_size_candidates)
+        return logits[..., :n_block], logits[..., n_block:]
+
+    def _categorical_joint_loglik(
+        self,
+        samples: torch.Tensor,
+        logits: torch.Tensor,
+        sampling_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Joint log-prob of one (block size, threshold) action pair.
+
+        The heads are conditionally independent given the state, so the joint log-prob
+        is the sum of the two (formulation.md 5.3).
+
+        :param samples: (..., 2) action indices [block idx, threshold idx]
+        :param logits: (..., K_block + K_thres) concatenated head logits
+        :param sampling_masks: (..., 1) True on real decisions, False on padding
+        :return: (...,) joint log-likelihood
+        """
+        block_logits, thres_logits = self._split_joint_logits(logits)
+        active = sampling_masks[..., 0]
+        return categorical_batch_loglik(
+            samples[..., 0],
+            block_logits,
+            action_mask=active,
+            dtype=self.args.loglikelihood_dtype,
+        ) + categorical_batch_loglik(
+            samples[..., 1],
+            thres_logits,
+            action_mask=active,
+            dtype=self.args.loglikelihood_dtype,
+        )
+
     def _compute_mask_loglikelihood(
         self,
         samples: torch.Tensor,
         sampling_inputs: torch.Tensor,
         sampling_masks: torch.Tensor,
     ) -> torch.Tensor:
-        if self.args.sampling_mode in ["bernoulli", "bernoulli-argmax"]:
+        if self.args.sampling_mode == "categorical":
+            return self._categorical_joint_loglik(
+                samples=samples,
+                logits=sampling_inputs,
+                sampling_masks=sampling_masks,
+            )
+        elif self.args.sampling_mode in ["bernoulli", "bernoulli-argmax"]:
             return bernoulli_batch_loglik(
                 samples=samples,
                 utilities=sampling_inputs,
@@ -544,18 +615,35 @@ class Trainer(GRPOTrainer):
                     dtype=unwrapped_model.dtype,
                     device=unwrapped_model.device,
                 ).unsqueeze(-1)
-            if self.args.remasking == "policy":
+            if self.args.remasking in ("policy", "block_policy"):
                 policy_outputs_all = []
                 still_masked_all = []
+                block_sizes_all = []
+                thresholds_all = []
+                is_block_policy = self.args.remasking == "block_policy"
                 for i in range(0, prompt_ids.size(0), generation_batch_size):
                     end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                     batch_prompt_ids = prompt_ids[i:end_idx]
                     batch_prompt_mask = prompt_mask[i:end_idx]
 
+                    extra_kwargs = {}
+                    if is_block_policy:
+                        # block_length is unused here: the policy picks it per block,
+                        # and the threshold likewise comes from the policy, not
+                        # self.args.thres.
+                        extra_kwargs = {
+                            "block_size_candidates": tuple(
+                                self.args.block_size_candidates
+                            ),
+                            "threshold_candidates": tuple(
+                                self.args.threshold_candidates
+                            ),
+                        }
+
                     result = generate_unified(
                         model=self.dllm,
                         prompt=batch_prompt_ids,
-                        remasking="policy",
+                        remasking=self.args.remasking,
                         policy=unwrapped_model,
                         gen_length=gen_length,
                         block_length=block_length,
@@ -567,7 +655,11 @@ class Trainer(GRPOTrainer):
                         confidences_top_p=self.args.confidences_top_p,
                         model_type=self.args.model_type,
                         attention_mask=batch_prompt_mask,
+                        **extra_kwargs,
                     )
+                    if is_block_policy:
+                        block_sizes_all.append(result.block_sizes_chosen)
+                        thresholds_all.append(result.thresholds_chosen)
 
                     # Extract values from NamedTuple
                     batch_prompt_completion_ids = result.sequences
@@ -929,116 +1021,189 @@ class Trainer(GRPOTrainer):
                     )
 
         # Log metrics to detect the collapse to 0 policy
-        avg_us_all = []
-        max_us_all = []
-        non_zero_active_us_all = []
-        non_zero_bs_timesteps_all = []
-        for i in range(
-            # Drop last batch, corresponding to ES samples, if present
-            len(policy_outputs_all) - (1 if self.args.es_thresholds else 0)
-        ):
-            sampling_inputs = policy_outputs_all[i][
-                "sampling_inputs"
-            ]  # Contains logits for both Bernoulli and DPLS
-            samples = policy_outputs_all[i][
-                "samples"
-            ]  # One-hot bernoulli outcomes for Bernoulli, ordered indices for PL
-            ms = policy_outputs_all[i]["sampling_masks"]
-
-            # Convert to probabilities for consistent logging across sampling modes
-            if self.args.sampling_mode == "dpls":
-                # For DPLS, sampling_inputs contains logits, convert to probabilities
-                # Do not normalize over unmasked tokens
-                sampling_inputs = torch.where(
-                    ms.any(dim=-1).unsqueeze(-1),
-                    sampling_inputs.masked_fill(~ms, float("-inf")),
-                    torch.zeros_like(sampling_inputs),
-                )
-                us = torch.softmax(sampling_inputs, dim=-1, dtype=torch.float32)
-                # Similarly samples need to be converted to one-hot
-                # (do not care about their ordering for logging)
-                # Since samples vector may contain padding (-1), we clamp to valid indices
-                # but then dynamically set the value to True/False - making the scatter
-                # a no-op at the padded indices
-                bs = (
-                    torch.zeros_like(us, dtype=torch.int)
-                    .scatter_add(-1, samples.clamp(min=0), (samples >= 0).int())
-                    .bool()
-                )
-            else:
-                # For Bernoulli, sampling_inputs contains logits, convert to probabilities with sigmoid
-                us = torch.sigmoid(sampling_inputs)
-                # And samples contains the sampled unmasking indices (one-hot)
-                bs = samples
-
-            # For average unmask probability as well as for proportion of non-zero unmask probability,
-            # we average both over time and the block dimension
-            avg_us = (us * ms).sum(dim=(-1, -2)) / ms.sum(dim=(-1, -2))
-            eps = 0.001
-            non_zero_active_us = ((us * ms) > eps).sum(dim=(-1, -2)) / ms.sum(
-                dim=(-1, -2)
+        if self.args.remasking == "block_policy":
+            # The per-position unmask-probability diagnostics below are meaningless for
+            # a categorical action; log the action distribution instead. Per
+            # formulation.md 9 the histogram and the entropy are the collapse signal
+            # that decides whether to abandon the run early.
+            device = num_steps.device
+            cand_b = torch.tensor(
+                self.args.block_size_candidates, device=device, dtype=torch.long
             )
-            avg_us_all.append(avg_us)
-            non_zero_active_us_all.append(non_zero_active_us)
-
-            active_timesteps = ms.any(dim=-1)  # (B, T)
-            # For max unmask probability, we aggregate over the block dimension only
-            # and then avg over the active timesteps
-            max_us = torch.amax(us * ms, dim=(-1))
-            max_us = (max_us * active_timesteps).sum(dim=-1) / active_timesteps.sum(
-                dim=-1
+            cand_t = torch.tensor(
+                self.args.threshold_candidates, device=device, dtype=torch.float32
             )
-            max_us_all.append(max_us)
-            # For non-zero bs, we take any over the block dimension and
-            # then avg over the active timesteps
-            non_zero_bs_timesteps = bs.any(dim=-1)  # (B, T)
-            non_zero_bs_timesteps = (non_zero_bs_timesteps * active_timesteps).sum(
-                dim=-1
-            ) / active_timesteps.sum(dim=-1)
-            non_zero_bs_timesteps_all.append(non_zero_bs_timesteps)
 
-        avg_us_all = torch.cat(avg_us_all, dim=0)
-        max_us_all = torch.cat(max_us_all, dim=0)
-        non_zero_active_us_all = torch.cat(non_zero_active_us_all, dim=0)
-        non_zero_bs_timesteps_all = torch.cat(non_zero_bs_timesteps_all, dim=0)
+            # Accumulate over generation chunks rather than concatenating them:
+            # each chunk packs its decisions to its own T, so a cat along dim 0
+            # would hit a size mismatch on dim 1 whenever there is >1 chunk.
+            counts_b = torch.zeros(len(cand_b), device=device)
+            counts_t = torch.zeros(len(cand_t), device=device)
+            totals = torch.zeros(3, device=device)  # [n_decisions, sum_b, sum_t]
+            per_row_blocks = []
+            for bs_chunk, th_chunk, po in zip(
+                block_sizes_all, thresholds_all, policy_outputs_all
+            ):
+                act = po["sampling_masks"][..., 0]  # (B, T)
+                counts_b += (
+                    ((bs_chunk.unsqueeze(-1) == cand_b) & act.unsqueeze(-1))
+                    .sum(dim=(0, 1))
+                    .float()
+                )
+                counts_t += (
+                    (
+                        ((th_chunk.unsqueeze(-1) - cand_t).abs() < 1e-6)
+                        & act.unsqueeze(-1)
+                    )
+                    .sum(dim=(0, 1))
+                    .float()
+                )
+                totals += torch.stack(
+                    [
+                        act.sum().float(),
+                        (bs_chunk * act).sum().float(),
+                        (th_chunk * act).sum().float(),
+                    ]
+                )
+                per_row_blocks.append(act.sum(dim=-1).float())
 
-        avg_us_all = self.accelerator.gather_for_metrics(avg_us_all)
-        non_zero_active_us_all = self.accelerator.gather_for_metrics(
-            non_zero_active_us_all
-        )
-        max_us_all = self.accelerator.gather_for_metrics(max_us_all)
+            # gather_for_metrics uses all_gather, which requires identical shapes on
+            # every rank. The number of decisions differs per rank (rollouts pick
+            # different block counts), so reduce to fixed-shape summaries first and
+            # only then gather. Gathering the ragged per-decision tensor directly
+            # would hang under NCCL.
+            counts_b = self.accelerator.gather_for_metrics(counts_b.unsqueeze(0)).sum(0)
+            counts_t = self.accelerator.gather_for_metrics(counts_t.unsqueeze(0)).sum(0)
+            totals = self.accelerator.gather_for_metrics(totals.unsqueeze(0)).sum(0)
+            # (B,) is the same on every rank, so this one gathers safely as-is.
+            per_row_blocks = self.accelerator.gather_for_metrics(
+                torch.cat(per_row_blocks, dim=0)
+            )
 
+            n_dec = totals[0].clamp(min=1.0)
+            self._metrics[mode]["block_size/mean"].append((totals[1] / n_dec).item())
+            self._metrics[mode]["threshold/mean"].append((totals[2] / n_dec).item())
+            self._metrics[mode]["num_blocks_mean"].append(
+                per_row_blocks.mean().item()
+            )
+            for i, b in enumerate(self.args.block_size_candidates):
+                self._metrics[mode][f"block_size/frac_{b}"].append(
+                    (counts_b[i] / n_dec).item()
+                )
+            for i, t in enumerate(self.args.threshold_candidates):
+                self._metrics[mode][f"threshold/frac_{t}"].append(
+                    (counts_t[i] / n_dec).item()
+                )
+        else:
+            avg_us_all = []
+            max_us_all = []
+            non_zero_active_us_all = []
+            non_zero_bs_timesteps_all = []
+            for i in range(
+                # Drop last batch, corresponding to ES samples, if present
+                len(policy_outputs_all) - (1 if self.args.es_thresholds else 0)
+            ):
+                sampling_inputs = policy_outputs_all[i][
+                    "sampling_inputs"
+                ]  # Contains logits for both Bernoulli and DPLS
+                samples = policy_outputs_all[i][
+                    "samples"
+                ]  # One-hot bernoulli outcomes for Bernoulli, ordered indices for PL
+                ms = policy_outputs_all[i]["sampling_masks"]
+
+                # Convert to probabilities for consistent logging across sampling modes
+                if self.args.sampling_mode == "dpls":
+                    # For DPLS, sampling_inputs contains logits, convert to probabilities
+                    # Do not normalize over unmasked tokens
+                    sampling_inputs = torch.where(
+                        ms.any(dim=-1).unsqueeze(-1),
+                        sampling_inputs.masked_fill(~ms, float("-inf")),
+                        torch.zeros_like(sampling_inputs),
+                    )
+                    us = torch.softmax(sampling_inputs, dim=-1, dtype=torch.float32)
+                    # Similarly samples need to be converted to one-hot
+                    # (do not care about their ordering for logging)
+                    # Since samples vector may contain padding (-1), we clamp to valid indices
+                    # but then dynamically set the value to True/False - making the scatter
+                    # a no-op at the padded indices
+                    bs = (
+                        torch.zeros_like(us, dtype=torch.int)
+                        .scatter_add(-1, samples.clamp(min=0), (samples >= 0).int())
+                        .bool()
+                    )
+                else:
+                    # For Bernoulli, sampling_inputs contains logits, convert to probabilities with sigmoid
+                    us = torch.sigmoid(sampling_inputs)
+                    # And samples contains the sampled unmasking indices (one-hot)
+                    bs = samples
+
+                # For average unmask probability as well as for proportion of non-zero unmask probability,
+                # we average both over time and the block dimension
+                avg_us = (us * ms).sum(dim=(-1, -2)) / ms.sum(dim=(-1, -2))
+                eps = 0.001
+                non_zero_active_us = ((us * ms) > eps).sum(dim=(-1, -2)) / ms.sum(
+                    dim=(-1, -2)
+                )
+                avg_us_all.append(avg_us)
+                non_zero_active_us_all.append(non_zero_active_us)
+
+                active_timesteps = ms.any(dim=-1)  # (B, T)
+                # For max unmask probability, we aggregate over the block dimension only
+                # and then avg over the active timesteps
+                max_us = torch.amax(us * ms, dim=(-1))
+                max_us = (max_us * active_timesteps).sum(dim=-1) / active_timesteps.sum(
+                    dim=-1
+                )
+                max_us_all.append(max_us)
+                # For non-zero bs, we take any over the block dimension and
+                # then avg over the active timesteps
+                non_zero_bs_timesteps = bs.any(dim=-1)  # (B, T)
+                non_zero_bs_timesteps = (non_zero_bs_timesteps * active_timesteps).sum(
+                    dim=-1
+                ) / active_timesteps.sum(dim=-1)
+                non_zero_bs_timesteps_all.append(non_zero_bs_timesteps)
+
+            avg_us_all = torch.cat(avg_us_all, dim=0)
+            max_us_all = torch.cat(max_us_all, dim=0)
+            non_zero_active_us_all = torch.cat(non_zero_active_us_all, dim=0)
+            non_zero_bs_timesteps_all = torch.cat(non_zero_bs_timesteps_all, dim=0)
+
+            avg_us_all = self.accelerator.gather_for_metrics(avg_us_all)
+            non_zero_active_us_all = self.accelerator.gather_for_metrics(
+                non_zero_active_us_all
+            )
+            max_us_all = self.accelerator.gather_for_metrics(max_us_all)
+
+            non_zero_bs_timesteps_all = self.accelerator.gather_for_metrics(
+                non_zero_bs_timesteps_all
+            )
+
+            self._metrics[mode]["mean_unmask_prob"].append(avg_us_all.mean().item())
+            self._metrics[mode]["non_zero_unmask_prob"].append(
+                non_zero_active_us_all.mean().item()
+            )
+            self._metrics[mode]["max_unmask_prob"].append(max_us_all.mean().item())
+
+            self._metrics[mode]["non_zero_bs_timesteps_mean"].append(
+                non_zero_bs_timesteps_all.mean().item()
+            )
+            self._metrics[mode]["non_zero_bs_timesteps_std"].append(
+                non_zero_bs_timesteps_all.std().item()
+            )
+            self._metrics[mode]["non_zero_bs_timesteps_min"].append(
+                non_zero_bs_timesteps_all.min().item()
+            )
+            self._metrics[mode]["non_zero_bs_timesteps_max"].append(
+                non_zero_bs_timesteps_all.max().item()
+            )
+
+        # NFE metrics apply to both action types
         num_steps = self.accelerator.gather_for_metrics(num_steps).float()
-
         num_steps = num_steps[post_gathering_policy_only_index]
-
-        non_zero_bs_timesteps_all = self.accelerator.gather_for_metrics(
-            non_zero_bs_timesteps_all
-        )
-
-        self._metrics[mode]["mean_unmask_prob"].append(avg_us_all.mean().item())
-        self._metrics[mode]["non_zero_unmask_prob"].append(
-            non_zero_active_us_all.mean().item()
-        )
-        self._metrics[mode]["max_unmask_prob"].append(max_us_all.mean().item())
-
         self._metrics[mode]["num_steps_mean"].append(num_steps.mean().item())
         self._metrics[mode]["num_steps_std"].append(num_steps.std().item())
         self._metrics[mode]["num_steps_min"].append(num_steps.min().item())
         self._metrics[mode]["num_steps_max"].append(num_steps.max().item())
-
-        self._metrics[mode]["non_zero_bs_timesteps_mean"].append(
-            non_zero_bs_timesteps_all.mean().item()
-        )
-        self._metrics[mode]["non_zero_bs_timesteps_std"].append(
-            non_zero_bs_timesteps_all.std().item()
-        )
-        self._metrics[mode]["non_zero_bs_timesteps_min"].append(
-            non_zero_bs_timesteps_all.min().item()
-        )
-        self._metrics[mode]["non_zero_bs_timesteps_max"].append(
-            non_zero_bs_timesteps_all.max().item()
-        )
 
         if (
             self.log_completions

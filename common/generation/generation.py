@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from common.generation.sampling import bernoulli_sample
+from common.generation.sampling import categorical_sample
 from common.generation.sampling import dpls_sample
 
 
@@ -22,6 +23,14 @@ class GenerationResult(NamedTuple):
     policy_inputs: tuple[torch.Tensor, ...] | None = None
     still_masked: torch.Tensor | None = None  # (B,)
     block_sizes: list[int] | None = None  # Adaptive block sizes (adaptive_block only)
+    # (B, L) step index at which each generated position was unmasked, -1 if never
+    # (only populated when record_unmask_order=True)
+    unmask_order: torch.Tensor | None = None
+
+    # Realized joint actions, one row per rollout (remasking='block_policy' only).
+    # Padded to T with sampling_masks marking the real decisions.
+    block_sizes_chosen: torch.Tensor | None = None  # (B, T) chosen block length
+    thresholds_chosen: torch.Tensor | None = None  # (B, T) chosen Fast-dLLM threshold
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -55,10 +64,21 @@ def generate_unified(
     adaptive_block: bool = False,
     delimiter_ids: tuple[int, ...] = (198,),
     delimiter_threshold: float = 0.3,
+    record_unmask_order: bool = False,
+    block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
+    threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
 ) -> GenerationResult:
     if remasking == "policy":
         if policy is None:
             raise ValueError("policy must be provided for remasking='policy'")
+    elif remasking == "block_policy":
+        if policy is None:
+            raise ValueError("policy must be provided for remasking='block_policy'")
+        if gen_length % min(block_size_candidates) != 0:
+            raise ValueError(
+                f"gen_length ({gen_length}) must be divisible by the smallest block "
+                f"candidate ({min(block_size_candidates)}) so blocks tile exactly"
+            )
     elif remasking == "fastdllm":
         if thres is None:
             raise ValueError("thres must be provided for remasking='fastdllm'")
@@ -104,6 +124,23 @@ def generate_unified(
     # Strategy-specific state
     record_policy_data = policy is not None
     sampling_history = [] if record_policy_data else None
+
+    # (B, L) step at which each position was unmasked; -1 while still masked
+    unmask_order = (
+        torch.full((B, L), -1, dtype=torch.int32, device=x.device)
+        if record_unmask_order
+        else None
+    )
+
+    def _record_order(unmask):
+        # steps_taken is incremented after the decision, so it is the 0-based
+        # index of the step that is being applied right now
+        nonlocal unmask_order
+        unmask_order = torch.where(
+            unmask & (unmask_order < 0),
+            steps_taken.unsqueeze(-1).to(unmask_order.dtype),
+            unmask_order,
+        )
 
     max_steps = L
     if remasking in ["low_confidence", "random"]:
@@ -208,7 +245,142 @@ def generate_unified(
         return unmask
 
     block_sizes = None
-    if not adaptive_block:
+    block_policy_data = None
+    if remasking == "block_policy":
+        # Learned joint (block size, threshold) schedule; see formulation.md.
+        #
+        # Unlike the two paths below, block boundaries are PER ROW: group members
+        # necessarily sample different block sizes, and training rolls out 128
+        # sequences at once, so a batch-shared `block_slice` cannot represent the
+        # state. Every row carries its own [block_start, block_end) and its own
+        # threshold, and rows advance to their next block independently.
+        #
+        # The outer iteration is one forward pass, not one block. A row makes a
+        # decision only on the step where it enters a new block, which is also the
+        # step that performs that block's first unmasking -- so the decision costs
+        # no extra NFE.
+        cand_b = torch.tensor(block_size_candidates, dtype=torch.long, device=x.device)
+        cand_t = torch.tensor(
+            threshold_candidates, dtype=torch.float32, device=x.device
+        )
+        # Worst case is every block taking the smallest candidate.
+        T_cap = L // int(cand_b.min().item())
+
+        block_start = torch.zeros(B, dtype=torch.long, device=x.device)
+        block_end = torch.zeros(B, dtype=torch.long, device=x.device)
+        dec_count = torch.zeros(B, dtype=torch.long, device=x.device)
+        row_thres = torch.zeros((B, 1), dtype=torch.float32, device=x.device)
+
+        # Decision-indexed buffers: slot t holds a row's t-th decision, NOT the t-th
+        # forward pass. Rows decide on different steps, so packing by decision keeps
+        # T at the number of blocks (<=32) instead of the number of forwards.
+        def _buf(*shape, dtype=torch.float32):
+            return torch.zeros((B, T_cap, *shape), dtype=dtype, device=x.device)
+
+        rec_block_logits = _buf(len(cand_b))
+        rec_thres_logits = _buf(len(cand_t))
+        rec_actions = _buf(2, dtype=torch.long)
+        rec_mask = _buf(1, dtype=torch.bool)
+        rec_m = _buf(L, dtype=torch.bool)
+        rec_c = _buf(L, confidences_top_p)
+        rec_t = _buf(1)
+        rec_start = _buf(1, dtype=torch.long)
+        rec_block_size = _buf(dtype=torch.long)
+        rec_thres = _buf()
+
+        positions = torch.arange(L, device=x.device)
+
+        for _ in range(L):
+            generation_part = x[:, prompt_L:]
+            mask_index = (generation_part == mask_id) & (
+                steps_taken < max_steps
+            ).unsqueeze(-1)
+            active = mask_index.any(dim=-1)
+            if not active.any():
+                break
+
+            model_output, probs, x0 = _forward_logits()
+            c_input = probs.topk(confidences_top_p, dim=-1).values  # (B, L, P)
+
+            # A row needs a new action exactly when it has no live block.
+            needs = active & (block_start == block_end)
+            if needs.any():
+                per_batch_timestep = steps_taken.unsqueeze(-1) * (1 / L)
+                block_logits, thres_logits = policy(
+                    mask_index, c_input, per_batch_timestep, block_start.unsqueeze(-1)
+                )
+                if temperature_policy != 1.0:
+                    block_logits = block_logits / temperature_policy
+                    thres_logits = thres_logits / temperature_policy
+
+                feasible = torch.isfinite(block_logits)
+                b_idx = categorical_sample(block_logits, feasible)  # (B,)
+                t_idx = categorical_sample(thres_logits)  # (B,)
+                chosen_b = cand_b[b_idx]
+                chosen_t = cand_t[t_idx]
+
+                block_end = torch.where(needs, block_start + chosen_b, block_end)
+                row_thres = torch.where(
+                    needs.unsqueeze(-1), chosen_t.unsqueeze(-1), row_thres
+                )
+
+                rows = needs.nonzero(as_tuple=True)[0]
+                # The tiling invariant caps decisions at T_cap; clamp defensively so a
+                # violation corrupts one slot instead of raising an indexing error.
+                slot = dec_count[rows].clamp(max=T_cap - 1)
+                rec_block_logits[rows, slot] = block_logits[rows].float()
+                rec_thres_logits[rows, slot] = thres_logits[rows].float()
+                rec_actions[rows, slot, 0] = b_idx[rows]
+                rec_actions[rows, slot, 1] = t_idx[rows]
+                rec_mask[rows, slot, 0] = True
+                rec_m[rows, slot] = mask_index[rows]
+                rec_c[rows, slot] = c_input[rows].float()
+                rec_t[rows, slot, 0] = per_batch_timestep[rows, 0].float()
+                rec_start[rows, slot, 0] = block_start[rows]
+                rec_block_size[rows, slot] = chosen_b[rows]
+                rec_thres[rows, slot] = chosen_t[rows]
+                dec_count = dec_count + needs.long()
+
+            block_index = (positions >= block_start.unsqueeze(-1)) & (
+                positions < block_end.unsqueeze(-1)
+            )  # (B, L)
+            block_mask_index = mask_index & block_index
+            unmask = _confidence_threshold_unmask_rowwise(
+                block_mask_index, probs, row_thres
+            )
+
+            x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+            if record_unmask_order:
+                _record_order(unmask)
+            steps_taken += block_mask_index.any(dim=-1).int()
+
+            # Rows whose current block is now full advance; start == end then triggers
+            # a fresh decision on the next iteration.
+            block_done = ~((x[:, prompt_L:] == mask_id) & block_index).any(dim=-1)
+            block_start = torch.where(active & block_done, block_end, block_start)
+
+        assert (dec_count <= T_cap).all(), (
+            f"decision count exceeded T_cap={T_cap}: {dec_count.max().item()}"
+        )
+        T_max = max(int(dec_count.max().item()), 1)
+        block_policy_data = {
+            # Both heads' logits share one tensor so the trainer's generic time-axis
+            # slicing works unchanged; it splits them back at len(cand_b).
+            "sampling_inputs": torch.cat(
+                [rec_block_logits[:, :T_max], rec_thres_logits[:, :T_max]], dim=-1
+            ),
+            "samples": rec_actions[:, :T_max],
+            "sampling_masks": rec_mask[:, :T_max],
+            "policy_inputs": (
+                rec_m[:, :T_max],
+                rec_c[:, :T_max],
+                rec_t[:, :T_max],
+                rec_start[:, :T_max],
+            ),
+            "block_sizes_chosen": rec_block_size[:, :T_max],
+            "thresholds_chosen": rec_thres[:, :T_max],
+        }
+    elif not adaptive_block:
         for num_block in range(num_blocks):
             start_idx = num_block * block_length
             end_idx = start_idx + block_length
@@ -233,6 +405,8 @@ def generate_unified(
 
                 # Apply unmasking
                 x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+                if record_unmask_order:
+                    _record_order(unmask)
 
                 # Update steps taken: only count steps for batch elements that had work to do
                 steps_taken += block_mask_index.any(dim=-1).int()
@@ -271,6 +445,8 @@ def generate_unified(
                 mask_index, block_mask_index, block_slice, model_output, probs, x0
             )
             x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+            if record_unmask_order:
+                _record_order(unmask)
             steps_taken += block_mask_index.any(dim=-1).int()
 
             for _ in range(block_len - 1):
@@ -288,6 +464,8 @@ def generate_unified(
                     mask_index, block_mask_index, block_slice, model_output, probs, x0
                 )
                 x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+                if record_unmask_order:
+                    _record_order(unmask)
                 steps_taken += block_mask_index.any(dim=-1).int()
 
             start_idx = end_idx
@@ -296,6 +474,15 @@ def generate_unified(
     if record_policy_data:
         generation_part = x[:, prompt_L:]
         still_masked = (generation_part == mask_id).any(dim=-1)
+
+        if block_policy_data is not None:
+            return GenerationResult(
+                sequences=x,
+                steps_taken=steps_taken,
+                still_masked=still_masked,
+                unmask_order=unmask_order,
+                **block_policy_data,
+            )
 
         if sampling_history:
             # Stack all sampling data for training
@@ -325,12 +512,14 @@ def generate_unified(
             policy_inputs=policy_inputs_result,
             still_masked=still_masked,
             block_sizes=block_sizes,
+            unmask_order=unmask_order,
         )
     else:
         return GenerationResult(
             sequences=x,
             steps_taken=steps_taken,
             block_sizes=block_sizes,
+            unmask_order=unmask_order,
         )
 
 
@@ -547,6 +736,46 @@ def _confidence_threshold_unmask(
         (probs.shape[0], probs.shape[1]), dtype=torch.bool, device=probs.device
     )
     unmask[:, block_slice] = unmask_local
+    return unmask
+
+
+def _confidence_threshold_unmask_rowwise(
+    block_mask_index: torch.Tensor,
+    probs: torch.Tensor,
+    thres: torch.Tensor,
+) -> torch.Tensor:
+    """Row-wise Fast-dLLM thresholding for per-row block boundaries and thresholds.
+
+    Sibling of _confidence_threshold_unmask, which takes a batch-shared block slice and
+    a single threshold. Two deliberate differences:
+
+    - the block is a (B, L) mask, since every row may sit in a different block;
+    - the "nothing cleared the threshold" fallback is applied **per row**. The shared
+      version tests `if not unmask_local.any()` across the whole batch, so with B > 1 a
+      stalled row can be starved by another row that did clear. Here a stalled row would
+      never finish its block, so the fallback must be row-wise.
+
+    The existing function is left untouched so previously collected baselines stay
+    reproducible (all of them ran at batch size 1, where the two agree).
+
+    :param block_mask_index: (B, L) still-masked positions inside each row's own block
+    :param probs: (B, L, V) next-token probabilities
+    :param thres: (B, 1) per-row confidence threshold
+    :return: (B, L) boolean mask of positions to unmask
+    """
+    confidence = probs.max(dim=-1).values  # (B, L)
+    confidence = confidence.masked_fill(~block_mask_index, -torch.inf)
+
+    unmask = confidence > thres  # (B, L), broadcasts (B,1) over positions
+
+    # A row with masked positions left in its block but nothing above threshold must
+    # still make progress, otherwise the block never completes and the loop spins.
+    stalled = block_mask_index.any(dim=-1) & ~unmask.any(dim=-1)  # (B,)
+    if stalled.any():
+        force_idx = confidence.argmax(dim=-1)  # (B,)
+        rows = stalled.nonzero(as_tuple=True)[0]
+        unmask[rows, force_idx[rows]] = True
+
     return unmask
 
 

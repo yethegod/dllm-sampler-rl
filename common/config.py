@@ -88,7 +88,31 @@ class Config(GRPOConfig):
     policy_type: str = field(
         default="dit_confidence",
         metadata={
-            "help": "Type of policy to use. Options: ['dit_hidden', 'dit_confidence']."
+            "help": "Type of policy to use. Options: ['dit_hidden', 'dit_confidence', 'dit_block_size']."
+        },
+    )
+
+    block_size_candidates: Optional[list[int]] = field(
+        default_factory=lambda: [8, 16, 32, 64, 128],
+        metadata={
+            "help": "Ascending candidate block sizes for the joint (block size, threshold) "
+            "policy. Only used when policy_type == 'dit_block_size'."
+        },
+    )
+
+    threshold_candidates: Optional[list[float]] = field(
+        default_factory=lambda: [0.5, 0.7, 0.9],
+        metadata={
+            "help": "Candidate Fast-dLLM confidence thresholds for the joint policy. "
+            "Only used when policy_type == 'dit_block_size'."
+        },
+    )
+
+    block_size_prior_logits: Optional[list[float]] = field(
+        default=None,
+        metadata={
+            "help": "Initial per-candidate bias for the block-size head. None means zeros "
+            "(near-uniform at init). Must match len(block_size_candidates)."
         },
     )
 
@@ -155,7 +179,16 @@ class Config(GRPOConfig):
     sampling_mode: str = field(
         default="bernoulli",
         metadata={
-            "help": "Type of sampling strategy to use. Options: ['bernoulli', 'bernoulli-argmax', 'dpls']."
+            "help": "Type of sampling strategy to use. Options: ['bernoulli', 'bernoulli-argmax', 'dpls', 'categorical']."
+        },
+    )
+
+    thres: float = field(
+        default=0.9,
+        metadata={
+            "help": "Fast-dLLM confidence threshold. Used as a fixed value by remasking="
+            "'fastdllm'; for remasking='block_policy' the policy chooses per block from "
+            "threshold_candidates and this is ignored."
         },
     )
 

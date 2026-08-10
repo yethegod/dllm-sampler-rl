@@ -30,6 +30,7 @@ class EvalConfig:
     n_test: int | None
     adaptive_block: bool = False
     delimiter_threshold: float = 0.3
+    remasking: str = "policy"
 
 
 def get_s3() -> s3fs.S3FileSystem:
@@ -123,6 +124,11 @@ def run_eval(
             output_dir = Path(f"{output_dir}_sampling_mode_{cfg.sampling_mode}")
         if cfg.adaptive_block:
             output_dir = Path(f"{output_dir}_ada{cfg.delimiter_threshold}")
+        if cfg.remasking == "block_policy":
+            # The dir name encodes neither block length nor threshold (the policy
+            # picks both per block), so tag it to keep these runs separate from a
+            # fixed-block eval of the same checkpoint.
+            output_dir = Path(f"{output_dir}_blockpolicy")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -139,7 +145,7 @@ def run_eval(
             "--batch_size",
             "1",
             "--remasking",
-            "policy",
+            cfg.remasking,
             "--policy_path",
             str(policy_path),
             "--output_dir",
@@ -254,6 +260,13 @@ def main():
     parser.add_argument("--n_test", type=int, default=None)
     parser.add_argument("--adaptive_block", action="store_true")
     parser.add_argument("--delimiter_threshold", type=float, default=0.3)
+    parser.add_argument(
+        "--remasking",
+        default="policy",
+        choices=["policy", "block_policy"],
+        help="Learned strategy to evaluate. Ignored for baseline-* run paths, "
+        "whose method is parsed out of the checkpoint name.",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
 
@@ -286,6 +299,7 @@ def main():
             n_test=args.n_test,
             adaptive_block=args.adaptive_block,
             delimiter_threshold=args.delimiter_threshold,
+            remasking=args.remasking,
         )
         try:
             run_names.append(run_pipeline(cfg))

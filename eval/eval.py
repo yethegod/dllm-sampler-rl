@@ -29,6 +29,7 @@ from trl import TrlParser
 from common.config import Config
 from common.generation.generation import generate_unified
 from common.models.policy import DiTHiddenStatePolicy
+from common.models.policy import DiTBlockSizePolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from data.loaders.gsm8k import GSM8KDataset
@@ -113,6 +114,8 @@ def evaluate(
     adaptive_block=False,
     delimiter_ids=(198,),
     delimiter_threshold=0.3,
+    block_size_candidates=(8, 16, 32, 64, 128),
+    threshold_candidates=(0.5, 0.7, 0.9),
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -169,10 +172,10 @@ def evaluate(
                     }
                 )
 
-            if remasking == "policy":
+            if remasking in ("policy", "block_policy"):
                 if policy is None:
                     raise ValueError(
-                        "policy remasking requires a policy to be provided"
+                        f"{remasking} remasking requires a policy to be provided"
                     )
                 gen_kwargs.update(
                     {
@@ -184,6 +187,15 @@ def evaluate(
                         "confidences_top_p": confidences_top_p,
                     }
                 )
+                if remasking == "block_policy":
+                    # block_length is ignored: the policy picks it per block, along
+                    # with the Fast-dLLM threshold.
+                    gen_kwargs.update(
+                        {
+                            "block_size_candidates": tuple(block_size_candidates),
+                            "threshold_candidates": tuple(threshold_candidates),
+                        }
+                    )
             elif remasking == "fastdllm":
                 gen_kwargs["thres"] = thres
             else:
@@ -192,7 +204,7 @@ def evaluate(
             result = generate_unified(**gen_kwargs)
             out = result.sequences
 
-            if remasking == "policy":
+            if remasking in ("policy", "block_policy"):
                 steps_taken = result.steps_taken.tolist()
             elif remasking == "fastdllm":
                 steps_taken = [result.steps_taken.item()]
@@ -206,6 +218,26 @@ def evaluate(
             avg_block_size = None
             if result.block_sizes:
                 avg_block_size = sum(result.block_sizes) / len(result.block_sizes)
+
+            # Per-example decoding schedules. adaptive_block runs at batch size 1 and
+            # reports a single shared list; block_policy chooses per row, so unpack
+            # each row's real decisions (padded slots are dropped via sampling_masks).
+            n_out = len(generated_texts)
+            block_schedules = [result.block_sizes] * n_out
+            thres_schedules = [None] * n_out
+            avg_block_sizes = [avg_block_size] * n_out
+            if result.block_sizes_chosen is not None:
+                active = result.sampling_masks[..., 0]
+                for j in range(n_out):
+                    chosen = result.block_sizes_chosen[j][active[j]].tolist()
+                    block_schedules[j] = chosen
+                    thres_schedules[j] = [
+                        round(t, 4)
+                        for t in result.thresholds_chosen[j][active[j]].tolist()
+                    ]
+                    avg_block_sizes[j] = (
+                        sum(chosen) / len(chosen) if chosen else None
+                    )
 
             batch_wall_time = time.time() - start_time
             wall_time_per_sample = batch_wall_time / len(generated_texts)
@@ -250,8 +282,9 @@ def evaluate(
                         if hasattr(steps_taken[j], "item")
                         else steps_taken[j],
                         "wall_time": wall_time_per_sample,
-                        "avg_block_size": avg_block_size,
-                        "block_sizes": result.block_sizes,
+                        "avg_block_size": avg_block_sizes[j],
+                        "block_sizes": block_schedules[j],
+                        "thresholds": thres_schedules[j],
                     }
                     for j in range(len(task_ids))
                 ]
@@ -269,8 +302,9 @@ def evaluate(
                         if hasattr(steps_taken[j], "item")
                         else steps_taken[j],
                         "wall_time": wall_time_per_sample,
-                        "avg_block_size": avg_block_size,
-                        "block_sizes": result.block_sizes,
+                        "avg_block_size": avg_block_sizes[j],
+                        "block_sizes": block_schedules[j],
+                        "thresholds": thres_schedules[j],
                     }
                     for j in range(len(gt_answers))
                 ]
@@ -573,7 +607,7 @@ if __name__ == "__main__":
 
     # Load the policy
     policy = None
-    if args.remasking == "policy" and not args.baseline_mode:
+    if args.remasking in ("policy", "block_policy") and not args.baseline_mode:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         config = args.grpo_config
         if config.policy_type == "dit_hidden":
@@ -602,10 +636,32 @@ if __name__ == "__main__":
                 num_blocks=config.policy_num_blocks,
                 time_period=config.policy_time_period,
             ).to(device)
+        elif config.policy_type == "dit_block_size":
+            hidden_dim = config.policy_hidden_dim or 128
+            feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
+
+            policy_core = DiTBlockSizePolicy(
+                block_size_candidates=tuple(config.block_size_candidates),
+                thresholds=tuple(config.threshold_candidates),
+                block_size_prior_logits=(
+                    tuple(config.block_size_prior_logits)
+                    if config.block_size_prior_logits is not None
+                    else None
+                ),
+                hidden_dim=hidden_dim,
+                feedforward_dim=feedforward_dim,
+                num_heads=config.policy_num_heads,
+                dropout=config.policy_dropout,
+                time_embed_dim=config.policy_time_embed_dim,
+                smart_init=config.policy_smart_init,
+                confidences_top_p=config.confidences_top_p,
+                num_blocks=config.policy_num_blocks,
+                time_period=config.policy_time_period,
+            ).to(device)
         else:
             raise ValueError(
                 f"Policy type {config.policy_type} not supported. "
-                "Choose from ['dit_hidden', 'dit_confidence']"
+                "Choose from ['dit_hidden', 'dit_confidence', 'dit_block_size']"
             )
         policy = PolicyHFWrapper(policy_core, config.policy_type)
 
@@ -664,14 +720,16 @@ if __name__ == "__main__":
         mask_id=mask_id,
         model_type=_model_type,
         policy_full_context=args.grpo_config.policy_full_context
-        if args.remasking == "policy"
+        if args.remasking in ("policy", "block_policy")
         else False,
         confidences_top_p=args.grpo_config.confidences_top_p
-        if args.remasking == "policy"
+        if args.remasking in ("policy", "block_policy")
         else 1,
         adaptive_block=args.adaptive_block,
         delimiter_ids=args.delimiter_ids,
         delimiter_threshold=args.delimiter_threshold,
+        block_size_candidates=tuple(args.grpo_config.block_size_candidates),
+        threshold_candidates=tuple(args.grpo_config.threshold_candidates),
     )
 
     if accelerator.num_processes > 1:
@@ -692,6 +750,12 @@ if __name__ == "__main__":
         # AdaBlock fallback length during generation, which is done by now)
         if args.adaptive_block:
             args.block_length = f"ada{args.delimiter_threshold}"
+        elif args.remasking == "block_policy":
+            # The policy picks a block length (and a threshold) per block, so no
+            # single value describes the run. Label it distinctly for the same
+            # reason as adaptive_block: aggregation groups on block_length, and a
+            # numeric label would silently merge these rows with fixed-block runs.
+            args.block_length = "cat"
         results.update(
             {
                 "model_path": args.model_path,
@@ -700,7 +764,7 @@ if __name__ == "__main__":
                 "block_length": args.block_length,
                 "remasking": args.remasking,
                 "policy_path": args.policy_path,
-                "thres": args.thres,
+                "thres": None if args.remasking == "block_policy" else args.thres,
                 "n_test": args.n_test,
                 "adaptive_block": args.adaptive_block,
                 "delimiter_threshold": args.delimiter_threshold
