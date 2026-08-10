@@ -8,19 +8,22 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
-SELECTED_RUNS = {
-    ("baseline-low_confidence-K128", "baseline-low_confidence-K128"): "K128",
-    ("baseline-low_confidence-K256", "baseline-low_confidence-K256"): "K256",
-    ("baseline-fastdllm-t0.9", "baseline-fastdllm-t0.9"): "Fast-dLLM",
-    ("llada8b_bl32", "1870"): "Last ckpt (1870)",
-}
+def build_selected_runs(policy_run: str, policy_ckpt: str) -> dict:
+    """Runs to plot, keyed on (run, checkpoint). Baselines are fixed; the trained
+    policy point follows the --policy-run / --policy-ckpt args (e.g. llada8b_bl128)."""
+    return {
+        ("baseline-low_confidence-K128", "baseline-low_confidence-K128"): "K128",
+        ("baseline-low_confidence-K256", "baseline-low_confidence-K256"): "K256",
+        ("baseline-fastdllm-t0.9", "baseline-fastdllm-t0.9"): "Fast-dLLM",
+        (policy_run, policy_ckpt): f"Last ckpt ({policy_ckpt})",
+    }
 
 
-def load_points(summary_csv: Path) -> list[dict]:
+def load_points(summary_csv: Path, selected_runs: dict) -> list[dict]:
     points = []
     with summary_csv.open(newline="") as file:
         for row in csv.DictReader(file):
-            label = SELECTED_RUNS.get((row["run"], row["checkpoint"]))
+            label = selected_runs.get((row["run"], row["checkpoint"]))
             if label is None or row["dataset"] != "gsm8k":
                 continue
             points.append(
@@ -32,9 +35,9 @@ def load_points(summary_csv: Path) -> list[dict]:
                     "accuracy_std": float(row["accuracy_std"] or 0),
                 }
             )
-    if len(points) != len(SELECTED_RUNS):
+    if len(points) != len(selected_runs):
         found = {point["label"] for point in points}
-        missing = set(SELECTED_RUNS.values()) - found
+        missing = set(selected_runs.values()) - found
         raise ValueError(f"Missing evaluation rows: {sorted(missing)}")
     return points
 
@@ -53,7 +56,7 @@ def is_pareto_optimal(point: dict, points: list[dict]) -> bool:
     )
 
 
-def plot(points: list[dict], output: Path) -> None:
+def plot(points: list[dict], output: Path, policy_label: str) -> None:
     frontier = sorted(
         (point for point in points if is_pareto_optimal(point, points)),
         key=lambda point: point["nfe"],
@@ -73,13 +76,13 @@ def plot(points: list[dict], output: Path) -> None:
     )
 
     offsets = {
-        "Last ckpt (1870)": (10, -2),
+        policy_label: (10, -2),
         "Fast-dLLM": (10, -28),
         "K128": (10, -2),
         "K256": (-105, -28),
     }
     colors = {
-        "Last ckpt (1870)": "#2A9D8F",
+        policy_label: "#2A9D8F",
         "Fast-dLLM": "#E76F51",
         "K128": "#7A7A7A",
         "K256": "#457B9D",
@@ -118,8 +121,14 @@ def plot(points: list[dict], output: Path) -> None:
     ax.set_title("GSM8K Accuracy vs. Inference Compute", fontsize=15, pad=12)
     ax.set_xlabel("Average NFE (lower is better)", fontsize=11)
     ax.set_ylabel("Accuracy (%) (higher is better)", fontsize=11)
-    ax.set_xlim(60, 275)
-    ax.set_ylim(73.5, 80.3)
+    # Auto axis limits with margin, so the plot adapts to whatever block-length
+    # run is passed (NFE/accuracy ranges differ between BL32 and BL128).
+    nfes = [point["nfe"] for point in points]
+    accs = [point["accuracy"] for point in points]
+    nfe_pad = 0.08 * (max(nfes) - min(nfes) or 1)
+    acc_pad = 0.15 * (max(accs) - min(accs) or 1)
+    ax.set_xlim(min(nfes) - nfe_pad, max(nfes) + nfe_pad)
+    ax.set_ylim(min(accs) - acc_pad, max(accs) + acc_pad)
     ax.legend(loc="lower right", frameon=True)
     ax.text(
         0.01,
@@ -140,8 +149,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("summary_csv", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--policy-run", default="llada8b_bl32")
+    parser.add_argument("--policy-ckpt", default="1870")
     args = parser.parse_args()
-    plot(load_points(args.summary_csv), args.output)
+    selected_runs = build_selected_runs(args.policy_run, args.policy_ckpt)
+    policy_label = f"Last ckpt ({args.policy_ckpt})"
+    plot(load_points(args.summary_csv, selected_runs), args.output, policy_label)
 
 
 if __name__ == "__main__":
