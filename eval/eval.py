@@ -116,6 +116,7 @@ def evaluate(
     delimiter_threshold=0.3,
     block_size_candidates=(8, 16, 32, 64, 128),
     threshold_candidates=(0.5, 0.7, 0.9),
+    block_schedule=None,
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -187,24 +188,27 @@ def evaluate(
                         "confidences_top_p": confidences_top_p,
                     }
                 )
-                if remasking == "block_policy":
-                    # block_length is ignored: the policy picks it per block, along
-                    # with the Fast-dLLM threshold.
-                    gen_kwargs.update(
-                        {
-                            "block_size_candidates": tuple(block_size_candidates),
-                            "threshold_candidates": tuple(threshold_candidates),
-                        }
-                    )
             elif remasking == "fastdllm":
                 gen_kwargs["thres"] = thres
-            else:
+            elif remasking != "block_schedule":
                 gen_kwargs["steps"] = steps
+
+            if remasking in ("block_policy", "block_schedule"):
+                # block_length is ignored: the block size is picked per block, along
+                # with the Fast-dLLM threshold.
+                gen_kwargs.update(
+                    {
+                        "block_size_candidates": tuple(block_size_candidates),
+                        "threshold_candidates": tuple(threshold_candidates),
+                    }
+                )
+                if remasking == "block_schedule":
+                    gen_kwargs["block_schedule"] = tuple(block_schedule)
 
             result = generate_unified(**gen_kwargs)
             out = result.sequences
 
-            if remasking in ("policy", "block_policy"):
+            if remasking in ("policy", "block_policy", "block_schedule"):
                 steps_taken = result.steps_taken.tolist()
             elif remasking == "fastdllm":
                 steps_taken = [result.steps_taken.item()]
@@ -226,8 +230,10 @@ def evaluate(
             block_schedules = [result.block_sizes] * n_out
             thres_schedules = [None] * n_out
             avg_block_sizes = [avg_block_size] * n_out
+            action_logits = [None] * n_out
             if result.block_sizes_chosen is not None:
                 active = result.sampling_masks[..., 0]
+                n_b = len(block_size_candidates)
                 for j in range(n_out):
                     chosen = result.block_sizes_chosen[j][active[j]].tolist()
                     block_schedules[j] = chosen
@@ -238,6 +244,22 @@ def evaluate(
                     avg_block_sizes[j] = (
                         sum(chosen) / len(chosen) if chosen else None
                     )
+                    # The full action distribution at each decision, not just the
+                    # action that got sampled. Sampling alone cannot separate "the
+                    # policy conditions on this problem" from "one distribution drawn
+                    # twice"; the logits can. Infeasible block sizes are -inf, which
+                    # is not valid JSON, so they go out as null.
+                    logits = result.sampling_inputs[j][active[j]].float().tolist()
+                    action_logits[j] = [
+                        {
+                            "block": [
+                                None if not math.isfinite(v) else round(v, 4)
+                                for v in row[:n_b]
+                            ],
+                            "thres": [round(v, 4) for v in row[n_b:]],
+                        }
+                        for row in logits
+                    ]
 
             batch_wall_time = time.time() - start_time
             wall_time_per_sample = batch_wall_time / len(generated_texts)
@@ -285,6 +307,7 @@ def evaluate(
                         "avg_block_size": avg_block_sizes[j],
                         "block_sizes": block_schedules[j],
                         "thresholds": thres_schedules[j],
+                        "action_logits": action_logits[j],
                     }
                     for j in range(len(task_ids))
                 ]
@@ -305,6 +328,7 @@ def evaluate(
                         "avg_block_size": avg_block_sizes[j],
                         "block_sizes": block_schedules[j],
                         "thresholds": thres_schedules[j],
+                        "action_logits": action_logits[j],
                     }
                     for j in range(len(gt_answers))
                 ]
@@ -514,8 +538,25 @@ if __name__ == "__main__":
         default="198",
         help="Comma-separated delimiter token ids for AdaBlock (198=newline)",
     )
+    parser.add_argument(
+        "--block_schedule",
+        type=str,
+        default=None,
+        help=(
+            "Fixed per-decision actions for --remasking block_schedule, as "
+            "'b:thres,b:thres,...' (e.g. '64:0.5,32:0.9'). The last entry repeats for "
+            "any further blocks. Both values must be in the configured candidate sets."
+        ),
+    )
     args = parser.parse_args()
     args.delimiter_ids = tuple(int(t) for t in args.delimiter_ids.split(","))
+    if args.block_schedule is not None:
+        args.block_schedule = tuple(
+            (int(b), float(t))
+            for b, t in (e.split(":") for e in args.block_schedule.split(","))
+        )
+    if args.remasking == "block_schedule" and not args.block_schedule:
+        parser.error("--remasking block_schedule requires --block_schedule")
 
     init_seed(args.seed)
 
@@ -730,6 +771,7 @@ if __name__ == "__main__":
         delimiter_threshold=args.delimiter_threshold,
         block_size_candidates=tuple(args.grpo_config.block_size_candidates),
         threshold_candidates=tuple(args.grpo_config.threshold_candidates),
+        block_schedule=args.block_schedule,
     )
 
     if accelerator.num_processes > 1:
@@ -756,6 +798,12 @@ if __name__ == "__main__":
             # reason as adaptive_block: aggregation groups on block_length, and a
             # numeric label would silently merge these rows with fixed-block runs.
             args.block_length = "cat"
+        elif args.remasking == "block_schedule":
+            # Same reason, and it must not merge with the learned-policy rows either:
+            # the whole point of this run is to be compared against them.
+            args.block_length = "sched" + ",".join(
+                f"{b}:{t}" for b, t in args.block_schedule
+            )
         results.update(
             {
                 "model_path": args.model_path,
@@ -764,7 +812,9 @@ if __name__ == "__main__":
                 "block_length": args.block_length,
                 "remasking": args.remasking,
                 "policy_path": args.policy_path,
-                "thres": None if args.remasking == "block_policy" else args.thres,
+                "thres": None
+                if args.remasking in ("block_policy", "block_schedule")
+                else args.thres,
                 "n_test": args.n_test,
                 "adaptive_block": args.adaptive_block,
                 "delimiter_threshold": args.delimiter_threshold

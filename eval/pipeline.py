@@ -31,6 +31,7 @@ class EvalConfig:
     adaptive_block: bool = False
     delimiter_threshold: float = 0.3
     remasking: str = "policy"
+    block_schedule: str | None = None
 
 
 def get_s3() -> s3fs.S3FileSystem:
@@ -124,6 +125,11 @@ def run_eval(
             output_dir = Path(f"{output_dir}_sampling_mode_{cfg.sampling_mode}")
         if cfg.adaptive_block:
             output_dir = Path(f"{output_dir}_ada{cfg.delimiter_threshold}")
+        if cfg.remasking == "block_schedule":
+            # Must not collide with the learned-policy dir for the same checkpoint;
+            # the schedule itself is the only thing that distinguishes the runs.
+            tag = cfg.block_schedule.replace(":", "").replace(",", "-")
+            output_dir = Path(f"{output_dir}_sched{tag}")
         if cfg.remasking == "block_policy":
             # The dir name encodes neither block length nor threshold (the policy
             # picks both per block), so tag it to keep these runs separate from a
@@ -169,6 +175,8 @@ def run_eval(
             cmd.extend(
                 ["--adaptive_block", "--delimiter_threshold", str(cfg.delimiter_threshold)]
             )
+        if cfg.remasking == "block_schedule":
+            cmd.extend(["--block_schedule", cfg.block_schedule])
 
         print(f"  Eval: {ckpt} seed={seed} temp={temp} {dataset}")
         result = subprocess.run(cmd, cwd=script_dir.parent)
@@ -263,12 +271,19 @@ def main():
     parser.add_argument(
         "--remasking",
         default="policy",
-        choices=["policy", "block_policy"],
+        choices=["policy", "block_policy", "block_schedule"],
         help="Learned strategy to evaluate. Ignored for baseline-* run paths, "
         "whose method is parsed out of the checkpoint name.",
     )
+    parser.add_argument(
+        "--block_schedule",
+        default=None,
+        help="Fixed 'b:thres,...' action list for --remasking block_schedule.",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
+    if args.remasking == "block_schedule" and not args.block_schedule:
+        parser.error("--remasking block_schedule requires --block_schedule")
 
     run_paths = (
         args.run_paths.split(";")
@@ -300,6 +315,7 @@ def main():
             adaptive_block=args.adaptive_block,
             delimiter_threshold=args.delimiter_threshold,
             remasking=args.remasking,
+            block_schedule=args.block_schedule,
         )
         try:
             run_names.append(run_pipeline(cfg))

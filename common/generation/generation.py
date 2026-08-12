@@ -67,13 +67,26 @@ def generate_unified(
     record_unmask_order: bool = False,
     block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
     threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
+    block_schedule: tuple[tuple[int, float], ...] | None = None,
 ) -> GenerationResult:
     if remasking == "policy":
         if policy is None:
             raise ValueError("policy must be provided for remasking='policy'")
-    elif remasking == "block_policy":
-        if policy is None:
-            raise ValueError("policy must be provided for remasking='block_policy'")
+    elif remasking in ("block_policy", "block_schedule"):
+        if remasking == "block_policy":
+            if policy is None:
+                raise ValueError("policy must be provided for remasking='block_policy'")
+            # Silently ignoring an unsupported mode here would make an eval look like
+            # it honoured --sampling_mode when it did not.
+            if sampling_mode not in ("categorical", "categorical-argmax"):
+                raise ValueError(
+                    "remasking='block_policy' supports sampling_mode 'categorical' or "
+                    f"'categorical-argmax', got {sampling_mode!r}"
+                )
+        elif not block_schedule:
+            raise ValueError(
+                "block_schedule must be provided for remasking='block_schedule'"
+            )
         if gen_length % min(block_size_candidates) != 0:
             raise ValueError(
                 f"gen_length ({gen_length}) must be divisible by the smallest block "
@@ -121,8 +134,9 @@ def generate_unified(
     else:
         _attn_mask = None
 
-    # Strategy-specific state
-    record_policy_data = policy is not None
+    # Strategy-specific state. block_schedule carries no policy but still produces the
+    # per-decision record that eval unpacks into block/threshold schedules.
+    record_policy_data = policy is not None or remasking == "block_schedule"
     sampling_history = [] if record_policy_data else None
 
     # (B, L) step at which each position was unmasked; -1 while still masked
@@ -246,8 +260,14 @@ def generate_unified(
 
     block_sizes = None
     block_policy_data = None
-    if remasking == "block_policy":
+    if remasking in ("block_policy", "block_schedule"):
         # Learned joint (block size, threshold) schedule; see formulation.md.
+        #
+        # remasking='block_schedule' reuses this loop verbatim with the policy call
+        # replaced by a lookup into a fixed per-decision (block size, threshold) list.
+        # It is the zero-parameter control for "did the policy learn anything beyond a
+        # content-independent schedule?" -- everything else about the rollout, down to
+        # the feasibility clamp and the NFE accounting, stays identical.
         #
         # Unlike the two paths below, block boundaries are PER ROW: group members
         # necessarily sample different block sizes, and training rolls out 128
@@ -265,6 +285,27 @@ def generate_unified(
         )
         # Worst case is every block taking the smallest candidate.
         T_cap = L // int(cand_b.min().item())
+
+        sched_b = sched_t = None
+        if remasking == "block_schedule":
+            # Resolve the schedule to candidate indices once, so the loop stays a
+            # gather and an out-of-set entry fails here rather than silently.
+            try:
+                sched_b = torch.tensor(
+                    [tuple(block_size_candidates).index(b) for b, _ in block_schedule],
+                    dtype=torch.long,
+                    device=x.device,
+                )
+                sched_t = torch.tensor(
+                    [tuple(threshold_candidates).index(t) for _, t in block_schedule],
+                    dtype=torch.long,
+                    device=x.device,
+                )
+            except ValueError as e:
+                raise ValueError(
+                    f"block_schedule {block_schedule} contains an action outside the "
+                    f"candidate sets {block_size_candidates} x {threshold_candidates}"
+                ) from e
 
         block_start = torch.zeros(B, dtype=torch.long, device=x.device)
         block_end = torch.zeros(B, dtype=torch.long, device=x.device)
@@ -306,16 +347,55 @@ def generate_unified(
             needs = active & (block_start == block_end)
             if needs.any():
                 per_batch_timestep = steps_taken.unsqueeze(-1) * (1 / L)
-                block_logits, thres_logits = policy(
-                    mask_index, c_input, per_batch_timestep, block_start.unsqueeze(-1)
-                )
-                if temperature_policy != 1.0:
-                    block_logits = block_logits / temperature_policy
-                    thres_logits = thres_logits / temperature_policy
+                if remasking == "block_schedule":
+                    # Decision index -> scheduled action; the last entry repeats.
+                    slot_s = dec_count.clamp(max=len(sched_b) - 1)  # (B,)
+                    b_idx = sched_b[slot_s]
+                    t_idx = sched_t[slot_s]
+                    # Same feasibility rule the policy head applies (policy.py: a
+                    # candidate is selectable only if the block fits in what is left).
+                    # An infeasible scheduled size falls back to the largest that fits,
+                    # which is also what the masked policy would have been forced into.
+                    feasible = (block_start.unsqueeze(-1) + cand_b) <= L  # (B, K)
+                    feasible[:, 0] = True  # never leave a row with no action
+                    largest_fit = torch.where(
+                        feasible, cand_b.expand(B, -1), torch.zeros_like(cand_b)
+                    ).argmax(dim=-1)
+                    b_idx = torch.where(
+                        feasible.gather(-1, b_idx.unsqueeze(-1)).squeeze(-1),
+                        b_idx,
+                        largest_fit,
+                    )
+                    # No policy distribution exists here; the recorded logits are only
+                    # carried so the returned record has the same shape as block_policy.
+                    block_logits = torch.zeros(
+                        (B, len(cand_b)), dtype=torch.float32, device=x.device
+                    ).masked_fill(~feasible, float("-inf"))
+                    thres_logits = torch.zeros(
+                        (B, len(cand_t)), dtype=torch.float32, device=x.device
+                    )
+                else:
+                    block_logits, thres_logits = policy(
+                        mask_index,
+                        c_input,
+                        per_batch_timestep,
+                        block_start.unsqueeze(-1),
+                    )
+                    if temperature_policy != 1.0:
+                        block_logits = block_logits / temperature_policy
+                        thres_logits = thres_logits / temperature_policy
 
-                feasible = torch.isfinite(block_logits)
-                b_idx = categorical_sample(block_logits, feasible)  # (B,)
-                t_idx = categorical_sample(thres_logits)  # (B,)
+                    feasible = torch.isfinite(block_logits)
+                    if sampling_mode == "categorical-argmax":
+                        # Greedy deployment, as opposed to the E_{a~pi}[R] that GRPO
+                        # optimises and that plain 'categorical' measures.
+                        b_idx = block_logits.masked_fill(
+                            ~feasible, float("-inf")
+                        ).argmax(dim=-1)
+                        t_idx = thres_logits.argmax(dim=-1)
+                    else:
+                        b_idx = categorical_sample(block_logits, feasible)  # (B,)
+                        t_idx = categorical_sample(thres_logits)  # (B,)
                 chosen_b = cand_b[b_idx]
                 chosen_t = cand_t[t_idx]
 
