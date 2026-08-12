@@ -12,6 +12,8 @@ Local additions on top of upstream (see `git log`): AdaBlock-style adaptive bloc
 
 Python 3.12, conda env `dllm`. There is no test suite, linter config, or CI in this repo — do not invent commands for them. `HF_TOKEN` is read from `.env` in the working directory (gitignored).
 
+**Commit to `main`.** This is a single-author fork with no PR flow; do not open a feature branch for a change unless explicitly asked. The two clusters do not share home directories, so `main` on `origin` is how code moves between Delta and DeltaAI — work parked on a side branch is work the other cluster cannot run.
+
 ```bash
 pip install -e .
 
