@@ -1,0 +1,134 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Block-size-only policy: the action is just b, with the Fast-dLLM threshold
+# pinned at 0.9. Derived from llada_8b_instruct_dit_blocksize_joint.yaml; exactly
+# four fields differ (threshold_candidates, block_size_candidates,
+# alpha_compute_reward, num_generations) so the two runs isolate the effect of
+# dropping tau from the action space.
+#
+# A one-element threshold_candidates makes the threshold head a 1-way softmax:
+# log_softmax is identically 0, so it contributes no log-prob, no entropy and no
+# gradient (verified: threshold_head.weight.grad norm is exactly 0). No code
+# change is needed to drop the axis.
+#
+# THE BAR. tau=0.9 row on GSM8K (1319 questions, LLaDA-8B-Instruct, L=256,
+# greedy, seed 42), E[R] = 1{correct} * ((L - min(N,L) + 1)/L)^alpha at alpha=1:
+#   b=8    79.08% /  99.8 NFE / 0.4965      b=64   80.67% / 78.0 NFE / 0.5734  <- bar
+#   b=16   79.68% /  88.1 NFE / 0.5370      b=128  71.11% / 81.3 NFE / 0.5045
+#   b=32   79.45% /  81.5 NFE / 0.5552      AdaBlock ada0.3 79.83% / 85.3 / 0.5446
+# b=64 is the best constant at every alpha in {0, 0.25, 0.5, 1.0}, and the
+# AdaBlock heuristic loses to it at every alpha.
+#
+# Why this is worth running even though b=64 dominates on average: dominance in
+# the *mean* says nothing about per-example dominance. On these same questions a
+# per-example oracle over b alone at tau=0.9 scores E[R] = 0.6315, +10.1% over
+# the bar. That is an upper bound -- partly chaotic sensitivity to the schedule
+# rather than predictable structure -- and separating the two is what training is
+# meant to settle (formulation.md 2.2, 9).
+#
+# CAVEAT: b=48 and b=96 are new candidates with no measured constant baseline.
+# If the learned policy piles mass on them, "found state-dependence" cannot be
+# separated from "found a better constant" until those two cells are run.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# Standard GRPO group size, halved from the joint run's 16 because the action
+# space also halved (15 -> 7). Measured on the tau=0.9 grid, this costs little:
+# the fraction of steps GRPO skips for zero reward variance goes 12.00% (G=16) ->
+# 12.58% (G=8), against a G-independent floor of 11.90% (prompts no action
+# solves), and expected action coverage per group is 71% here vs 67% in the joint
+# run. The real trade is a 1.41x noisier group-mean baseline in exchange for 16
+# prompts per optimizer step instead of 8 at the same wall-clock. If entropy sits
+# pinned near ln 7 with no reward movement for a few hundred steps, raising this
+# back to 16 is the first knob.
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_policy (the policy picks the block length per block);
+# kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# alpha=1 is the reward's linear-decay setting; see the alpha semantics comment
+# in train/reward_func.py:_multiplicative_step_scaling_reward_func. Note the bar
+# is b=64 at every alpha in this row, so alpha controls how much accuracy the
+# policy may trade for speed, not which constant it has to beat.
+alpha_compute_reward: 1.0
+
+# Policy specific
+policy_type: dit_block_size
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -2.0
+sampling_mode: categorical
+
+# 7 block sizes x 1 threshold = 7 actions (ln 7 = 1.946 nats, vs ln 15 = 2.708
+# for the joint run). Every candidate is a multiple of 8 and L = 256, so the
+# remaining length stays a multiple of 8, b=8 always fits, and blocks tile
+# [0, L) exactly with no partial tail (formulation.md 3).
+block_size_candidates: [8, 16, 32, 48, 64, 96, 128]
+threshold_candidates: [0.9]
