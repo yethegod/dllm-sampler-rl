@@ -789,9 +789,12 @@ if __name__ == "__main__":
         }
         # Label adaptive-block runs distinctly so filenames and aggregation don't
         # collide with fixed-block results (block_length only serves as the
-        # AdaBlock fallback length during generation, which is done by now)
+        # AdaBlock fallback length during generation, which is done by now).
+        # B0 stays in the label: it is only the fallback, but it bounds how far
+        # ahead a delimiter can move the boundary, so two runs differing only in
+        # B0 are different runs and must not group together during aggregation.
         if args.adaptive_block:
-            args.block_length = f"ada{args.delimiter_threshold}"
+            args.block_length = f"ada{args.delimiter_threshold}_B{args.block_length}"
         elif args.remasking == "block_policy":
             # The policy picks a block length (and a threshold) per block, so no
             # single value describes the run. Label it distinctly for the same

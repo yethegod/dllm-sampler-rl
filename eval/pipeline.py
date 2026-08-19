@@ -12,6 +12,7 @@ from pathlib import Path
 
 import s3fs
 import torch
+import yaml
 
 
 @dataclass
@@ -32,6 +33,23 @@ class EvalConfig:
     delimiter_threshold: float = 0.3
     remasking: str = "policy"
     block_schedule: str | None = None
+
+
+def resolve_block_length(cfg: EvalConfig) -> int:
+    """B0 for an adaptive-block run: the CLI override, else the config's value.
+
+    eval.eval resolves it the same way; we duplicate it here because the output
+    directory name is built before the subprocess runs.
+    """
+    if cfg.block_length is not None:
+        return cfg.block_length
+    with open(cfg.config_path) as f:
+        block_length = yaml.safe_load(f).get("block_length")
+    assert block_length is not None, (
+        f"{cfg.config_path} sets no block_length; --adaptive_block needs it to "
+        "name the output dir, so pass --block_length explicitly"
+    )
+    return int(block_length)
 
 
 def get_s3() -> s3fs.S3FileSystem:
@@ -124,7 +142,13 @@ def run_eval(
         if cfg.sampling_mode:
             output_dir = Path(f"{output_dir}_sampling_mode_{cfg.sampling_mode}")
         if cfg.adaptive_block:
-            output_dir = Path(f"{output_dir}_ada{cfg.delimiter_threshold}")
+            # B0 belongs in the name: it is only the AdaBlock fallback length,
+            # but it changes the realized block sizes, and without it two Ada
+            # runs differing only in B0 write to the same directory.
+            output_dir = Path(
+                f"{output_dir}_ada{cfg.delimiter_threshold}"
+                f"_B{resolve_block_length(cfg)}"
+            )
         if cfg.remasking == "block_schedule":
             # Must not collide with the learned-policy dir for the same checkpoint;
             # the schedule itself is the only thing that distinguishes the runs.
