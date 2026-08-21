@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=96g
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=ada-b0-sweep
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -39,7 +39,10 @@
 # Delta (gpuA100x4), not DeltaAI: the ghx4 copy of this sweep sat behind a
 # ~29h priority wait. Same shared /work/hdd paths, so the results land in the
 # same place either way; only the preamble and the conda hook differ.
-# 8h walltime rather than 4h because an A100 is slower than a GH200 here.
+# 4h walltime: 2 cells at ~50 min each on 4xA100 (the 8h figure was for the
+# 3-seed, 6-cell version). Sized for backfill, not for headroom -- if a cell
+# turns out slower than that, the finished cells are already on disk and the
+# rest can be resubmitted.
 
 set -euo pipefail
 
@@ -52,13 +55,18 @@ CONFIG=configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.
 BASELINE=baseline-fastdllm-t0.9
 DELIM_THRES=0.3
 B0_LIST="16 32"
-# NOTE: the fastdllm baseline is deterministic -- token decoding runs at
-# --temperature 0.0 (eval.py's default; eval.pipeline never overrides it) so
-# add_gumbel_noise is a no-op, no policy is loaded, and with no --n_test the
-# dataset is not subsampled, so nothing consumes the RNG. Seeds 43/44 reproduce
-# 42 bit-for-bit. Kept at three seeds because that is what was asked for and it
-# costs ~40 extra minutes; set SEEDS=42 to drop them.
-SEEDS=42,43,44
+# NOTE: one seed only, deliberately. The fastdllm baseline is deterministic --
+# token decoding runs at --temperature 0.0 (eval.py's default; eval.pipeline
+# never overrides it) so add_gumbel_noise is a no-op, no policy is loaded, and
+# with no --n_test the dataset is not subsampled, so nothing consumes the RNG.
+# Seeds 43/44 reproduced 42 bit-for-bit, i.e. ~3.3h of duplicate decoding on
+# 4xA100 for zero extra information, so they were dropped (job 21325233 was
+# cancelled mid-flight for this and resubmitted). Do not add seeds back here
+# unless something in this cell stops being deterministic -- a learned policy
+# (remasking: policy with a sampling temperature), --n_test subsampling, or a
+# nonzero --temperature. Error bars for these rows have to come from bootstrap
+# over the 1319 examples, not from seeds.
+SEEDS=42
 
 source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
 conda activate dllm
@@ -70,8 +78,17 @@ mkdir -p "$RESULTS" "$REPO/slurm/logs"
 cd "$REPO"
 
 # Smoke phase: both B0 values on 8 samples. Fails fast if the directory naming
-# regresses to the name-route collision described above.
+# regresses to the name-route collision described above. It costs ~40 min,
+# almost all of it re-reading the 15GB of LLaDA weights off /work/hdd twice, so
+# SKIP_SMOKE=1 is there for a resubmit of unchanged code whose smoke phase
+# already passed in an earlier job. Leave it at 0 whenever this script, the
+# pipeline naming, or eval.py's block_length labelling has been touched.
+SKIP_SMOKE=${SKIP_SMOKE:-0}
 SMOKE=$WORK/eval_results/adablock_b0_sweep_smoke
+
+if [ "$SKIP_SMOKE" = "1" ]; then
+  echo "SKIP_SMOKE=1: skipping the 8-sample naming check"
+else
 rm -rf "$SMOKE"
 
 for B0 in $B0_LIST; do
@@ -106,6 +123,7 @@ for f in files:
 assert len(labels) == len(files), f"B0 cells collided: {labels} across {len(files)} files"
 print(f"smoke OK: {sorted(labels)}")
 EOF
+fi
 
 # Full sweep.
 for B0 in $B0_LIST; do
