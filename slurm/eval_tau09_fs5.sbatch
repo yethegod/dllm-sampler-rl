@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=96g
-#SBATCH --time=06:00:00
+#SBATCH --time=02:00:00
 #SBATCH --array=0-15
 #SBATCH --job-name=eval-tau09-fs5
 #SBATCH --output=slurm/logs/%x_%A_%a.out
@@ -51,6 +51,11 @@
 #    the "_ada<tau_D>_B<B0>" directory suffix would never be appended and the
 #    three B0 values would overwrite each other. See eval_adablock_b0_sweep.sbatch.
 #
+#
+# WALLTIME. Slowest arm is AdaBlock B0=16: 4.03s/example measured at 0 shots,
+# 1319/4 = 330 examples per GPU, ~3x per-forward cost at 5 shots (1203 tokens vs
+# 404), so ~70 min including model load. 2h leaves ~1.7x headroom and backfills
+# far better than a padded request.
 # Placement: 4 GPUs, whole node, one (arm, seed) per task. eval.pipeline launches
 # torch.cuda.device_count() processes, eval.py's sampler calls
 # dist.get_world_size() unconditionally (so >=2), and the rendezvous port 29500
