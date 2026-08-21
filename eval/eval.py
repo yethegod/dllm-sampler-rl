@@ -819,6 +819,7 @@ if __name__ == "__main__":
                 if args.remasking in ("block_policy", "block_schedule")
                 else args.thres,
                 "n_test": args.n_test,
+                "few_shot": args.few_shot,
                 "adaptive_block": args.adaptive_block,
                 "delimiter_threshold": args.delimiter_threshold
                 if args.adaptive_block

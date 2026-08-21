@@ -5,6 +5,7 @@
 # Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,25 @@ Your reasoning here
 <answer>
 \\boxed{...}
 </answer>"""
+
+
+def format_demo_answer(answer: str) -> str:
+    """Rewrite a raw GSM8K train answer into the format the system prompt asks for.
+
+    The raw answers carry calculator annotations and end in "#### 72", but the
+    grader (common/parsing/parse_and_get_acc.py:extract_gsm_answer) only reads
+    \\boxed{} and <answer></answer>. Demonstrations in the raw format would teach
+    the model to answer in a format that is scored as a miss, so the shots have
+    to speak the same format as the system prompt and as the "<reasoning>" that
+    create_prompt prefills.
+    """
+    rationale, _, final = answer.partition("####")
+    rationale = re.sub(r"<<[^>]*>>", "", rationale).strip()
+    final = final.strip().replace(",", "")
+    return (
+        f"<reasoning>\n{rationale}\n</reasoning>\n"
+        f"<answer>\n\\boxed{{{final}}}\n</answer>"
+    )
 
 
 class GSM8KDataset(torch.utils.data.Dataset):
@@ -78,16 +98,21 @@ class GSM8KDataset(torch.utils.data.Dataset):
             return user_input
 
     def load_few_shot_examples(self):
-        if isinstance(self.dataset, GSM8KDataset):
-            local_path = DATASETS_PATH / "gsm8k"
-            if local_path.exists():
-                train_data = load_from_disk(str(local_path))["train"]
-            else:
-                train_data = load_dataset("openai/gsm8k", "main")["train"]
-            examples = random.sample(range(len(train_data)), self.num_examples)
-            return [train_data[example] for example in examples]
-        else:
+        if self.num_examples <= 0:
             return []
+        local_path = DATASETS_PATH / "gsm8k"
+        if local_path.exists():
+            train_data = load_from_disk(str(local_path))["train"]
+        else:
+            train_data = load_dataset("openai/gsm8k", "main")["train"]
+        examples = random.sample(range(len(train_data)), self.num_examples)
+        return [
+            {
+                "question": train_data[i]["question"],
+                "answer": format_demo_answer(train_data[i]["answer"]),
+            }
+            for i in examples
+        ]
 
     def create_few_shot_prompt(self):
         """Create few-shot prompt from dataset examples"""

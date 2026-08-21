@@ -33,6 +33,7 @@ class EvalConfig:
     delimiter_threshold: float = 0.3
     remasking: str = "policy"
     block_schedule: str | None = None
+    few_shot: int | None = None
 
 
 def resolve_block_length(cfg: EvalConfig) -> int:
@@ -154,6 +155,11 @@ def run_eval(
             # the schedule itself is the only thing that distinguishes the runs.
             tag = cfg.block_schedule.replace(":", "").replace(",", "-")
             output_dir = Path(f"{output_dir}_sched{tag}")
+        if cfg.few_shot is not None:
+            # Shot count changes the prompt, so a few-shot run is a different run:
+            # keep it out of the zero-shot directory. aggregate_results groups on
+            # the few_shot recorded inside the JSON, not on this suffix.
+            output_dir = Path(f"{output_dir}_fs{cfg.few_shot}")
         if cfg.remasking == "block_policy":
             # The dir name encodes neither block length nor threshold (the policy
             # picks both per block), so tag it to keep these runs separate from a
@@ -201,6 +207,8 @@ def run_eval(
             )
         if cfg.remasking == "block_schedule":
             cmd.extend(["--block_schedule", cfg.block_schedule])
+        if cfg.few_shot is not None:
+            cmd.extend(["--few_shot", str(cfg.few_shot)])
 
         print(f"  Eval: {ckpt} seed={seed} temp={temp} {dataset}")
         result = subprocess.run(cmd, cwd=script_dir.parent)
@@ -304,6 +312,13 @@ def main():
         default=None,
         help="Fixed 'b:thres,...' action list for --remasking block_schedule.",
     )
+    parser.add_argument(
+        "--few_shot",
+        type=int,
+        default=None,
+        help="Number of in-context examples. Default: eval.eval's per-dataset "
+        "default (0 for gsm8k/math/humaneval, 3 for mbpp).",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
     if args.remasking == "block_schedule" and not args.block_schedule:
@@ -340,6 +355,7 @@ def main():
             delimiter_threshold=args.delimiter_threshold,
             remasking=args.remasking,
             block_schedule=args.block_schedule,
+            few_shot=args.few_shot,
         )
         try:
             run_names.append(run_pipeline(cfg))

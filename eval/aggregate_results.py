@@ -16,6 +16,11 @@ from common.parsing.parse_and_get_acc import parse_gsm_answers
 from common.parsing.parse_and_get_acc import parse_math_answers
 
 
+# Only for generations written before few_shot was recorded in the JSON: those
+# runs all used eval/eval.py's per-dataset default, so that is what they get.
+LEGACY_FEW_SHOT_DEFAULTS = {"gsm8k": 0, "math": 0, "humaneval": 0, "mbpp": 3}
+
+
 def parse_checkpoint_name(path) -> int | str:
     basename = os.path.basename(path)
 
@@ -187,6 +192,11 @@ def aggregate_results(results_dir):
                 # int/str values break sorted() during grouping
                 "block_length": str(data.get("block_length", 32)),
                 "gen_length": data.get("gen_length", 256),
+                # The prompt differs between shot counts, so these are different
+                # runs and must not average together.
+                "few_shot": data.get(
+                    "few_shot", LEGACY_FEW_SHOT_DEFAULTS.get(dataset_name, 0)
+                ),
                 "expected_dataset_size": expected_size,
                 "actual_samples_processed": actual_size,
                 "test_set_complete": coverage_complete,
@@ -236,7 +246,16 @@ def create_summary_tables(df, output_dir):
     has_wall_time = df["avg_wall_time"].sum() > 0
     has_tokens = df["avg_effective_tokens"].sum() > 0
 
-    group_cols = ["run", "dataset", "block_length", "checkpoint", "temperature"]
+    # few_shot goes last so the console tables below can keep indexing the
+    # leading (run, checkpoint, temperature) fields positionally.
+    group_cols = [
+        "run",
+        "dataset",
+        "block_length",
+        "checkpoint",
+        "temperature",
+        "few_shot",
+    ]
 
     agg_dict = {
         "accuracy": ["mean", "std", "min", "max"],
@@ -282,6 +301,7 @@ def create_summary_tables(df, output_dir):
             display_df["Run"] = [idx[0] for idx in dataset_stats.index]
             display_df["Checkpoint"] = [idx[1] for idx in dataset_stats.index]
             display_df["Temp"] = [f"{idx[2]:.2f}" for idx in dataset_stats.index]
+            display_df["Shots"] = [f"{idx[3]}" for idx in dataset_stats.index]
 
             display_df["Accuracy"] = [
                 f"{row['accuracy_mean']:.2f}% +/- {row['accuracy_std']:.2f}"
@@ -376,7 +396,7 @@ def create_summary_tables(df, output_dir):
                 f.write(f"\nResults for {dataset.upper()}, BL={bl}:\n")
                 f.write("-" * 95 + "\n")
 
-                header = f"{'Run':>20} {'Checkpoint':>15} {'Temp':>6} {'Accuracy':>12} {'Std':>8} {'Seeds':>6}"
+                header = f"{'Run':>20} {'Checkpoint':>15} {'Temp':>6} {'Shots':>6} {'Accuracy':>12} {'Std':>8} {'Seeds':>6}"
                 if has_steps:
                     header += f" {'NFEs':>15}"
                 if has_wall_time:
@@ -388,11 +408,11 @@ def create_summary_tables(df, output_dir):
 
                 for idx in sorted(
                     dataset_stats.index,
-                    key=lambda x: (x[0], isinstance(x[1], str), x[1], x[2]),
+                    key=lambda x: (x[0], isinstance(x[1], str), x[1], x[2], x[3]),
                 ):
-                    run, checkpoint, temp = idx
+                    run, checkpoint, temp, few_shot = idx
                     row = dataset_stats.loc[idx]
-                    line = f"{run:>20} {checkpoint:>15} {temp:>6.2f} {row['accuracy_mean']:>8.2f}% +/- {row['accuracy_std']:>4.2f} {int(row['num_seeds']):>6}"
+                    line = f"{run:>20} {checkpoint:>15} {temp:>6.2f} {few_shot:>6} {row['accuracy_mean']:>8.2f}% +/- {row['accuracy_std']:>4.2f} {int(row['num_seeds']):>6}"
                     if has_steps and "avg_steps_mean" in row.index:
                         line += f" {row['avg_steps_mean']:>6.1f} +/- {row['avg_steps_std']:>4.1f}"
                     if has_wall_time and "avg_wall_time_mean" in row.index:
