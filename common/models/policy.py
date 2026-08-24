@@ -258,6 +258,17 @@ class DiTConfidencePolicy(nn.Module):
             # Initialize output_proj bias to target mean
             self.output_proj.bias.data.fill_(target_logit)
 
+    def embed_input(self, c: torch.Tensor) -> torch.Tensor:
+        """Map the per-position input stream to hidden_dim.
+
+        Split out of trunk() so subclasses can swap the input representation
+        without touching the transformer stack; see DiTHiddenProjPolicy.
+
+        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :return: (*B,L,hidden_dim)
+        """
+        return self.confidence_proj(c)
+
     def trunk(
         self,
         m: torch.Tensor,
@@ -270,7 +281,8 @@ class DiTConfidencePolicy(nn.Module):
         per-position hidden states (see DiTBlockSizePolicy).
 
         :param m: (*B,L) mask with 1=masked, 0=unmasked
-        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :param c: (*B,L,*) per-position input stream, whatever embed_input() accepts
+            (top-p confidences here, dLLM hidden states in DiTHiddenProjPolicy)
         :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
         :return: (*B,L,hidden_dim) normalized hidden states
         """
@@ -291,8 +303,8 @@ class DiTConfidencePolicy(nn.Module):
         time_embed = self.time_mlp(time_embed)
         cond = cond + time_embed
 
-        # Embed confidences
-        x = self.confidence_proj(c)
+        # Embed the per-position input stream
+        x = self.embed_input(c)
 
         # Transformer
         original_shape = x.shape
@@ -311,11 +323,52 @@ class DiTConfidencePolicy(nn.Module):
         timestep: torch.Tensor,
     ) -> torch.Tensor:
         """:param m: (*B,L) mask with 1=masked, 0=unmasked
-        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :param c: (*B,L,*) per-position input stream; see trunk()
         :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
         :return: (*B,L) unmasking logits
         """
         return self.output_proj(self.trunk(m, c, timestep)).squeeze(-1)
+
+
+class HiddenProjInputMixin:
+    """Swap a policy's per-position input stream from confidences to dLLM hidden states.
+
+    Mixed in ahead of a DiTConfidencePolicy subclass so that everything from the RoPE
+    DiT stack onward -- including DiTBlockSizePolicy's two heads -- is inherited
+    unchanged and only embed_input() differs. A single Linear does the whole job, in
+    contrast to DiTHiddenStatePolicy, which runs a full LLaDABlock at the dLLM's own
+    width.
+
+    The input LayerNorm is not optional. LLaDA's last-layer hidden states carry outlier
+    channels and their norm drifts with the timestep, so without it the projection
+    spends its first steps just undoing the scale.
+    """
+
+    def __init__(self, dllm, **kwargs):
+        super().__init__(**kwargs)
+
+        self.dllm_hidden_size = dllm.config.hidden_size
+
+        # confidence_proj is the base policy's input stream and is dead here. Dropping
+        # it keeps untrained weights out of every checkpoint (and out of DDP's
+        # unused-parameter bookkeeping) instead of shipping them forever.
+        del self.confidence_proj
+
+        # Non-affine: this only has to fix the scale, and an affine pair would be
+        # redundant with the projection immediately after it.
+        self.in_norm = nn.LayerNorm(self.dllm_hidden_size, elementwise_affine=False)
+        self.proj = nn.Linear(self.dllm_hidden_size, self.hidden_dim)
+        # Deliberately left at default init: zeroing it would make trunk()'s final_norm
+        # see an all-zero input and kill the gradient into proj.
+
+    def embed_input(self, h: torch.Tensor) -> torch.Tensor:
+        """:param h: (*B,L,dllm_hidden_size) last-layer hidden states from the dLLM
+        :return: (*B,L,hidden_dim)
+        """
+        assert h.shape[-1] == self.dllm_hidden_size, (
+            f"Expected hidden size {self.dllm_hidden_size}, got {h.shape[-1]}"
+        )
+        return self.proj(self.in_norm(h))
 
 
 class DiTBlockSizePolicy(DiTConfidencePolicy):
@@ -428,3 +481,18 @@ class DiTBlockSizePolicy(DiTConfidencePolicy):
         threshold_logits = self.threshold_head(pooled)  # (*B, K_thres)
 
         return block_logits, threshold_logits
+
+
+class DiTHiddenProjPolicy(HiddenProjInputMixin, DiTConfidencePolicy):
+    """DiTConfidencePolicy reading dLLM hidden states instead of top-p confidences.
+
+    forward(m, h, timestep) -> (*B,L) unmasking logits.
+    """
+
+
+class DiTBlockSizeHiddenProjPolicy(HiddenProjInputMixin, DiTBlockSizePolicy):
+    """DiTBlockSizePolicy reading dLLM hidden states instead of top-p confidences.
+
+    forward(m, h, timestep, block_start) -> (block-size logits, threshold logits).
+    Both heads read the shared trunk, so swapping embed_input() is the whole change.
+    """

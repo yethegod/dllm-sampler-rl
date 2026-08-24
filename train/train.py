@@ -23,7 +23,9 @@ from trl import TrlParser
 import train.reward_func as reward_func
 from common.config import Config
 from common.models.policy import DiTHiddenStatePolicy
+from common.models.policy import DiTHiddenProjPolicy
 from common.models.policy import DiTBlockSizePolicy
+from common.models.policy import DiTBlockSizeHiddenProjPolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from common.s3 import S3UploadCallback
@@ -93,8 +95,11 @@ def main(grpo_config, model_config):
         f"got '{grpo_config.remasking}'"
     )
     if grpo_config.remasking == "block_policy":
-        assert grpo_config.policy_type == "dit_block_size", (
-            f"remasking='block_policy' requires policy_type='dit_block_size', "
+        assert grpo_config.policy_type in (
+            "dit_block_size",
+            "dit_block_size_hidden_proj",
+        ), (
+            f"remasking='block_policy' requires a 'dit_block_size*' policy_type, "
             f"got '{grpo_config.policy_type}'"
         )
         assert grpo_config.sampling_mode == "categorical", (
@@ -209,6 +214,25 @@ def main(grpo_config, model_config):
             time_period=grpo_config.policy_time_period,
         ).to(device)
 
+    elif grpo_config.policy_type == "dit_hidden_proj":
+        assert grpo_config.model_type == "LLaDA", (
+            "dit_hidden_proj policy is only supported with LLaDA models, not Dream"
+        )
+        hidden_dim = grpo_config.policy_hidden_dim or 128
+        feedforward_dim = grpo_config.policy_feedforward_dim or (4 * hidden_dim)
+
+        policy_core = DiTHiddenProjPolicy(
+            dllm=model,
+            hidden_dim=hidden_dim,
+            feedforward_dim=feedforward_dim,
+            num_heads=grpo_config.policy_num_heads,
+            dropout=grpo_config.policy_dropout,
+            time_embed_dim=grpo_config.policy_time_embed_dim,
+            smart_init=grpo_config.policy_smart_init,
+            num_blocks=grpo_config.policy_num_blocks,
+            time_period=grpo_config.policy_time_period,
+        ).to(device)
+
     elif grpo_config.policy_type == "dit_confidence":
         hidden_dim = grpo_config.policy_hidden_dim or 128
         feedforward_dim = grpo_config.policy_feedforward_dim or (4 * hidden_dim)
@@ -246,10 +270,38 @@ def main(grpo_config, model_config):
             num_blocks=grpo_config.policy_num_blocks,
             time_period=grpo_config.policy_time_period,
         ).to(device)
+    elif grpo_config.policy_type == "dit_block_size_hidden_proj":
+        assert grpo_config.model_type == "LLaDA", (
+            "dit_block_size_hidden_proj policy is only supported with LLaDA models, "
+            "not Dream"
+        )
+        hidden_dim = grpo_config.policy_hidden_dim or 128
+        feedforward_dim = grpo_config.policy_feedforward_dim or (4 * hidden_dim)
+
+        policy_core = DiTBlockSizeHiddenProjPolicy(
+            dllm=model,
+            block_size_candidates=tuple(grpo_config.block_size_candidates),
+            thresholds=tuple(grpo_config.threshold_candidates),
+            block_size_prior_logits=(
+                tuple(grpo_config.block_size_prior_logits)
+                if grpo_config.block_size_prior_logits is not None
+                else None
+            ),
+            hidden_dim=hidden_dim,
+            feedforward_dim=feedforward_dim,
+            num_heads=grpo_config.policy_num_heads,
+            dropout=grpo_config.policy_dropout,
+            time_embed_dim=grpo_config.policy_time_embed_dim,
+            smart_init=grpo_config.policy_smart_init,
+            num_blocks=grpo_config.policy_num_blocks,
+            time_period=grpo_config.policy_time_period,
+        ).to(device)
+
     else:
         raise ValueError(
             f"Policy type {grpo_config.policy_type} not supported. "
-            "Choose from ['dit_hidden', 'dit_confidence', 'dit_block_size']"
+            "Choose from ['dit_hidden', 'dit_hidden_proj', 'dit_confidence', "
+            "'dit_block_size', 'dit_block_size_hidden_proj']"
         )
 
     policy = PolicyHFWrapper(policy_core, grpo_config.policy_type)

@@ -1397,6 +1397,7 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        final_hidden_state_only: bool = False,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1427,6 +1428,10 @@ class LLaDAModel(nn.Module):
         :param use_cache: If `True`, return key and value tensors for each block.
         :param last_logits_only: If `True`, only compute the logits for the last token of each sequence.
             This can speed up decoding when you only care about the next token.
+        :param final_hidden_state_only: If `True`, skip collecting the per-layer hidden
+            states and return only the final one, so `hidden_states` is a 1-tuple holding
+            what `hidden_states[-1]` would have been anyway. Callers that only read the
+            last layer save materialising `n_layers` copies of the whole activation.
         """
         # Add Basic MDM Model config check
         assert not self.config.alibi, (
@@ -1543,7 +1548,7 @@ class LLaDAModel(nn.Module):
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             for block_idx, block in enumerate(self.transformer.blocks):
-                if output_hidden_states:
+                if output_hidden_states and not final_hidden_state_only:
                     # add hidden states
                     all_hidden_states.append(x)
 
@@ -1592,7 +1597,7 @@ class LLaDAModel(nn.Module):
                     attn_key_values.append(cache)
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
-                if output_hidden_states:
+                if output_hidden_states and not final_hidden_state_only:
                     # add hidden states
                     all_hidden_states.append(x)
 
@@ -1622,7 +1627,9 @@ class LLaDAModel(nn.Module):
         # shape: (batch_size, seq_len or 1, d_model)
         x = self.transformer.ln_f(x)  # type: ignore
         if output_hidden_states:
-            # add final hidden state post-final-layernorm, following HuggingFace's convention
+            # add final hidden state post-final-layernorm, following HuggingFace's convention.
+            # Deliberately not gated on final_hidden_state_only: that flag drops the
+            # per-layer states, so hidden_states[-1] stays this exact tensor either way.
             all_hidden_states.append(x)
 
         # Get logits.
@@ -1690,6 +1697,7 @@ class LLaDAModelLM(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        final_hidden_state_only: bool = False,
         return_dict: Optional[bool] = None,
         cache_position: Optional[
             Cache
@@ -1714,6 +1722,7 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            final_hidden_state_only=final_hidden_state_only,
         )
 
         logits = outputs.logits

@@ -29,7 +29,9 @@ from trl import TrlParser
 from common.config import Config
 from common.generation.generation import generate_unified
 from common.models.policy import DiTHiddenStatePolicy
+from common.models.policy import DiTHiddenProjPolicy
 from common.models.policy import DiTBlockSizePolicy
+from common.models.policy import DiTBlockSizeHiddenProjPolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from data.loaders.gsm8k import GSM8KDataset
@@ -662,6 +664,24 @@ if __name__ == "__main__":
                 smart_init=config.policy_smart_init,
                 time_period=config.policy_time_period,
             ).to(device)
+        elif config.policy_type == "dit_hidden_proj":
+            assert _model_type == "LLaDA", (
+                "dit_hidden_proj policy is only supported with LLaDA models, not Dream"
+            )
+            hidden_dim = config.policy_hidden_dim or 128
+            feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
+
+            policy_core = DiTHiddenProjPolicy(
+                dllm=model,
+                hidden_dim=hidden_dim,
+                feedforward_dim=feedforward_dim,
+                num_heads=config.policy_num_heads,
+                dropout=config.policy_dropout,
+                time_embed_dim=config.policy_time_embed_dim,
+                smart_init=config.policy_smart_init,
+                num_blocks=config.policy_num_blocks,
+                time_period=config.policy_time_period,
+            ).to(device)
         elif config.policy_type == "dit_confidence":
             hidden_dim = config.policy_hidden_dim or 128
             feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
@@ -699,10 +719,37 @@ if __name__ == "__main__":
                 num_blocks=config.policy_num_blocks,
                 time_period=config.policy_time_period,
             ).to(device)
+        elif config.policy_type == "dit_block_size_hidden_proj":
+            assert _model_type == "LLaDA", (
+                "dit_block_size_hidden_proj policy is only supported with LLaDA "
+                "models, not Dream"
+            )
+            hidden_dim = config.policy_hidden_dim or 128
+            feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
+
+            policy_core = DiTBlockSizeHiddenProjPolicy(
+                dllm=model,
+                block_size_candidates=tuple(config.block_size_candidates),
+                thresholds=tuple(config.threshold_candidates),
+                block_size_prior_logits=(
+                    tuple(config.block_size_prior_logits)
+                    if config.block_size_prior_logits is not None
+                    else None
+                ),
+                hidden_dim=hidden_dim,
+                feedforward_dim=feedforward_dim,
+                num_heads=config.policy_num_heads,
+                dropout=config.policy_dropout,
+                time_embed_dim=config.policy_time_embed_dim,
+                smart_init=config.policy_smart_init,
+                num_blocks=config.policy_num_blocks,
+                time_period=config.policy_time_period,
+            ).to(device)
         else:
             raise ValueError(
                 f"Policy type {config.policy_type} not supported. "
-                "Choose from ['dit_hidden', 'dit_confidence', 'dit_block_size']"
+                "Choose from ['dit_hidden', 'dit_hidden_proj', 'dit_confidence', "
+                "'dit_block_size', 'dit_block_size_hidden_proj']"
             )
         policy = PolicyHFWrapper(policy_core, config.policy_type)
 

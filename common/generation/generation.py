@@ -170,11 +170,27 @@ def generate_unified(
             else policy.policy_type
         )
 
+    # The hidden-state policies read model_output.hidden_states[-1]; the confidence
+    # policies never touch it. Both decode paths below branch on this, so a new hidden
+    # policy missing from this tuple fails as `NoneType` far from the config.
+    wants_hidden = policy_type in (
+        "dit_hidden",
+        "dit_hidden_proj",
+        "dit_block_size_hidden_proj",
+    )
+
     def _forward_logits():
+        hidden_kwargs = {}
+        if wants_hidden:
+            # LLaDA-only: the kwarg keeps LLaDA from materialising all 33 layers when
+            # only the last is ever read. Dream's forward does not accept it, but every
+            # hidden policy asserts LLaDA at construction.
+            hidden_kwargs["final_hidden_state_only"] = True
         model_output = model(
             x,
             attention_mask=_attn_mask,
-            output_hidden_states=(policy_type == "dit_hidden"),
+            output_hidden_states=wants_hidden,
+            **hidden_kwargs,
         )
 
         # Handle Dream model logit shifting
@@ -323,7 +339,14 @@ def generate_unified(
         rec_actions = _buf(2, dtype=torch.long)
         rec_mask = _buf(1, dtype=torch.bool)
         rec_m = _buf(L, dtype=torch.bool)
-        rec_c = _buf(L, confidences_top_p)
+        # The policy's input stream: top-p confidences, or the dLLM's last-layer
+        # hidden state for the hidden-proj variant. Kept in the dLLM's own dtype
+        # there -- upcasting 4096 channels to fp32 would double a buffer that is
+        # already preallocated at full T_cap, and the policy recasts on use anyway.
+        if wants_hidden:
+            rec_c = _buf(L, model.config.hidden_size, dtype=model.dtype)
+        else:
+            rec_c = _buf(L, confidences_top_p)
         rec_t = _buf(1)
         rec_start = _buf(1, dtype=torch.long)
         rec_block_size = _buf(dtype=torch.long)
@@ -341,7 +364,15 @@ def generate_unified(
                 break
 
             model_output, probs, x0 = _forward_logits()
-            c_input = probs.topk(confidences_top_p, dim=-1).values  # (B, L, P)
+            # The policy's per-position input stream, sliced to the generation region
+            # so it lines up with mask_index -- the same slice _compute_policy_logits
+            # takes on the per-step path. The confidence branch's topk over the full
+            # vocab is skipped outright when the policy reads hidden states.
+            policy_stream = (
+                model_output.hidden_states[-1][:, prompt_L:, :]  # (B, L, D)
+                if wants_hidden
+                else probs.topk(confidences_top_p, dim=-1).values  # (B, L, P)
+            )
 
             # A row needs a new action exactly when it has no live block.
             needs = active & (block_start == block_end)
@@ -377,7 +408,7 @@ def generate_unified(
                 else:
                     block_logits, thres_logits = policy(
                         mask_index,
-                        c_input,
+                        policy_stream,
                         per_batch_timestep,
                         block_start.unsqueeze(-1),
                     )
@@ -414,7 +445,7 @@ def generate_unified(
                 rec_actions[rows, slot, 1] = t_idx[rows]
                 rec_mask[rows, slot, 0] = True
                 rec_m[rows, slot] = mask_index[rows]
-                rec_c[rows, slot] = c_input[rows].float()
+                rec_c[rows, slot] = policy_stream[rows].to(rec_c.dtype)
                 rec_t[rows, slot, 0] = per_batch_timestep[rows, 0].float()
                 rec_start[rows, slot, 0] = block_start[rows]
                 rec_block_size[rows, slot] = chosen_b[rows]
@@ -691,7 +722,7 @@ def _compute_policy_logits(
         topk_result.values if full_context else topk_result.values[:, block_slice]
     )
 
-    if policy_type == "dit_hidden":
+    if policy_type in ("dit_hidden", "dit_hidden_proj"):
         hidden_states = model_output.hidden_states[-1]
         hidden_states_input = (
             hidden_states[:, prompt_L:, :]

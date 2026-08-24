@@ -29,6 +29,7 @@ from common.config import Config
 from common.generation.generation import generate_unified
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import DiTHiddenStatePolicy
+from common.models.policy import DiTHiddenProjPolicy
 from common.models.policy import PolicyHFWrapper
 from eval.eval import DATASET_MAP
 from eval.eval import FEW_SHOT_DEFAULTS
@@ -218,7 +219,23 @@ def main():
                 num_blocks=cfg.policy_num_blocks,
                 time_period=cfg.policy_time_period,
             ).to(device)
-        else:
+        elif cfg.policy_type == "dit_hidden_proj":
+            assert model_type == "LLaDA", (
+                "dit_hidden_proj policy is only supported with LLaDA models, not Dream"
+            )
+            hidden_dim = cfg.policy_hidden_dim or 128
+            core = DiTHiddenProjPolicy(
+                dllm=model,
+                hidden_dim=hidden_dim,
+                feedforward_dim=cfg.policy_feedforward_dim or (4 * hidden_dim),
+                num_heads=cfg.policy_num_heads,
+                dropout=cfg.policy_dropout,
+                time_embed_dim=cfg.policy_time_embed_dim,
+                smart_init=cfg.policy_smart_init,
+                num_blocks=cfg.policy_num_blocks,
+                time_period=cfg.policy_time_period,
+            ).to(device)
+        elif cfg.policy_type == "dit_hidden":
             core = DiTHiddenStatePolicy(
                 dllm=model,
                 time_embed_dim=cfg.policy_time_embed_dim,
@@ -226,6 +243,10 @@ def main():
                 smart_init=cfg.policy_smart_init,
                 time_period=cfg.policy_time_period,
             ).to(device)
+        else:
+            # Was a bare `else` building DiTHiddenStatePolicy, which silently loaded
+            # the wrong module for any policy_type added later.
+            raise ValueError(f"Unsupported policy_type {cfg.policy_type}")
         policy = PolicyHFWrapper(core, cfg.policy_type)
         assert args.policy_path, "--policy_path is required for remasking=policy"
         policy.load_state_dict(load_file(args.policy_path))

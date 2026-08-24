@@ -88,7 +88,8 @@ class Config(GRPOConfig):
     policy_type: str = field(
         default="dit_confidence",
         metadata={
-            "help": "Type of policy to use. Options: ['dit_hidden', 'dit_confidence', 'dit_block_size']."
+            "help": "Type of policy to use. Options: ['dit_hidden', 'dit_hidden_proj', "
+            "'dit_confidence', 'dit_block_size', 'dit_block_size_hidden_proj']."
         },
     )
 
@@ -96,7 +97,7 @@ class Config(GRPOConfig):
         default_factory=lambda: [8, 16, 32, 64, 128],
         metadata={
             "help": "Ascending candidate block sizes for the joint (block size, threshold) "
-            "policy. Only used when policy_type == 'dit_block_size'."
+            "policy. Only used by the 'dit_block_size*' policy types."
         },
     )
 
@@ -104,7 +105,7 @@ class Config(GRPOConfig):
         default_factory=lambda: [0.5, 0.7, 0.9],
         metadata={
             "help": "Candidate Fast-dLLM confidence thresholds for the joint policy. "
-            "Only used when policy_type == 'dit_block_size'."
+            "Only used by the 'dit_block_size*' policy types."
         },
     )
 
