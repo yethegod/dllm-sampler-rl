@@ -2,6 +2,7 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2026 Apple Inc. All Rights Reserved.
 #
+import inspect
 from typing import NamedTuple
 
 import torch
@@ -179,13 +180,28 @@ def generate_unified(
         "dit_block_size_hidden_proj",
     )
 
-    def _forward_logits():
-        hidden_kwargs = {}
-        if wants_hidden:
-            # LLaDA-only: the kwarg keeps LLaDA from materialising all 33 layers when
-            # only the last is ever read. Dream's forward does not accept it, but every
-            # hidden policy asserts LLaDA at construction.
+    # This repo's modeling_llada.py adds final_hidden_state_only, which skips
+    # collecting the 32 per-layer hidden states nobody reads (~1.9 GiB/forward at
+    # B=16). But AutoModel.from_pretrained(trust_remote_code=True) resolves LLaDA
+    # through the Hub config's auto_map, so the class actually loaded is the Hub's
+    # copy, not the vendored one -- and Dream never had the kwarg. Ask the model
+    # rather than assume: passing it blind is a TypeError on the first forward.
+    hidden_kwargs = {}
+    if wants_hidden:
+        try:
+            params = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            params = {}
+        # A DDP wrapper's forward is (*inputs, **kwargs), so this lands on False and
+        # the kwarg is simply not passed -- conservative, never a TypeError.
+        if "final_hidden_state_only" in params:
             hidden_kwargs["final_hidden_state_only"] = True
+
+    # .dtype and .config live on the module, not on a DDP wrapper; same unwrap the
+    # attention-mask cast above does.
+    base_model = model.module if hasattr(model, "module") else model
+
+    def _forward_logits():
         model_output = model(
             x,
             attention_mask=_attn_mask,
@@ -344,7 +360,7 @@ def generate_unified(
         # there -- upcasting 4096 channels to fp32 would double a buffer that is
         # already preallocated at full T_cap, and the policy recasts on use anyway.
         if wants_hidden:
-            rec_c = _buf(L, model.config.hidden_size, dtype=model.dtype)
+            rec_c = _buf(L, base_model.config.hidden_size, dtype=base_model.dtype)
         else:
             rec_c = _buf(L, confidences_top_p)
         rec_t = _buf(1)
@@ -724,13 +740,18 @@ def _compute_policy_logits(
 
     if policy_type in ("dit_hidden", "dit_hidden_proj"):
         hidden_states = model_output.hidden_states[-1]
+        # .contiguous() is load-bearing, not tidiness. record_policy_data keeps one of
+        # these per timestep, and a slice is a view that pins its whole (B, prompt+gen,
+        # d_model) parent: 57 MiB per step instead of 32 at B=16, i.e. 1.78x on a
+        # buffer that already dominates the rollout. The block_policy path copies into
+        # a preallocated rec_c and so never had this problem.
         hidden_states_input = (
             hidden_states[:, prompt_L:, :]
             if full_context
             else hidden_states[
                 :, prompt_L + block_slice.start : prompt_L + block_slice.stop, :
             ]
-        )
+        ).contiguous()
         policy_inputs = (policy_mask, hidden_states_input, per_batch_timestep)
     elif policy_type == "dit_confidence":
         policy_inputs = (policy_mask, c_max_input, per_batch_timestep)

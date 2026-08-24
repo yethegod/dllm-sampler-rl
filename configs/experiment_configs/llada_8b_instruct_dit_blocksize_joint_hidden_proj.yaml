@@ -94,10 +94,12 @@ policy_time_embed_dim: 128
 policy_full_context: true
 policy_smart_init: -2.0
 
-# The policy input stream is (B,T,L,4096) here instead of (B,T,L,1), and
-# compute_loss casts the whole slice to the policy's fp32 before backward. T is
-# capped at L/min(block_size_candidates)=32 decisions on this path, but left at
-# the default (None -> all of T at once) that cast is still ~2 GiB.
+# The policy input stream is (B,T,L,4096) here instead of (B,T,L,1), and compute_loss
+# casts each slice to the policy's fp32. T is capped at
+# L/min(block_size_candidates)=32 decisions on this path, so the cast is ~2 GiB.
+# Chunking bounds its working set but not the peak: compute_loss chunks the forward
+# and backwards once, so every chunk's activations live until then. Measured peak for
+# this config at per_device_train_batch_size 16: 28.6 GiB (job 21410797, exit 0).
 timestep_batch_size: 8
 sampling_mode: categorical
 

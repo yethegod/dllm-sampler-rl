@@ -75,7 +75,9 @@ policy_time_embed_dim: 128
 policy_full_context: true
 policy_smart_init: -2.0
 
-# The policy input is (B,T,L,4096) here instead of (B,T,L,1), and compute_loss
-# casts the whole slice to the policy's fp32 before backward. Left at the default
-# (None -> the full T at once) that cast is ~8 GiB; chunking keeps it under 1.
+# The policy input is (B,T,L,4096) here instead of (B,T,L,1), and compute_loss casts
+# each slice to the policy's fp32. This bounds the cast's working set, but NOT the
+# peak: compute_loss chunks the forward and backwards once at the end, so every
+# chunk's activations stay alive until then. Measured 28.6 GiB peak on the
+# block_policy sibling of this config (job 21410797).
 timestep_batch_size: 8
