@@ -32,6 +32,10 @@ class GenerationResult(NamedTuple):
     # only populated when replay_policy_inputs=True. This is what compute_loss
     # replays through the dLLM instead of buffering (B,T,L,d_model) hidden states.
     state_history: torch.Tensor | None = None
+    # (B,T,L) the dLLM's argmax prediction at every position at each step, only
+    # populated when record_probe_data=True. Compared against the final sequence
+    # it gives the dense 'was it safe to unmask position i at step t' label.
+    x0_history: torch.Tensor | None = None
 
     # Realized joint actions, one row per rollout (remasking='block_policy' only).
     # Padded to T with sampling_masks marking the real decisions.
@@ -72,10 +76,16 @@ def generate_unified(
     delimiter_threshold: float = 0.3,
     record_unmask_order: bool = False,
     replay_policy_inputs: bool = False,
+    record_probe_data: bool = False,
     block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
     threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
     block_schedule: tuple[tuple[int, float], ...] | None = None,
 ) -> GenerationResult:
+    if record_probe_data and adaptive_block:
+        # Only the fixed-block loop has the recording hook; the adaptive and
+        # block_policy loops would silently return nothing.
+        raise ValueError("record_probe_data is not supported with adaptive_block")
+
     if remasking == "policy":
         if policy is None:
             raise ValueError("policy must be provided for remasking='policy'")
@@ -148,6 +158,8 @@ def generate_unified(
 
     # (B, L) step at which each position was unmasked; -1 while still masked
     state_history = None
+    x0_history = None
+    probe_states, probe_x0 = [], []
     unmask_order = (
         torch.full((B, L), -1, dtype=torch.int32, device=x.device)
         if record_unmask_order
@@ -548,6 +560,11 @@ def generate_unified(
                     break
 
                 model_output, probs, x0 = _forward_logits()
+                if record_probe_data:
+                    # Before the step is applied, so the state is what the decision was
+                    # made from and x0 is the token that decision would have committed.
+                    probe_states.append(generation_part.clone())
+                    probe_x0.append(x0.clone())
                 unmask = _step_decision(
                     mask_index, block_mask_index, block_slice, model_output, probs, x0
                 )
@@ -633,6 +650,10 @@ def generate_unified(
                 **block_policy_data,
             )
 
+        if record_probe_data:
+            x0_history = torch.stack(probe_x0, dim=1)  # (B, T, L)
+            state_history = torch.stack(probe_states, dim=1)  # (B, T, L)
+
         if sampling_history:
             # Stack all sampling data for training
             sampling_inputs = torch.stack(
@@ -669,13 +690,19 @@ def generate_unified(
             block_sizes=block_sizes,
             unmask_order=unmask_order,
             state_history=state_history,
+            x0_history=x0_history,
         )
     else:
+        if record_probe_data:
+            x0_history = torch.stack(probe_x0, dim=1)  # (B, T, L)
+            state_history = torch.stack(probe_states, dim=1)  # (B, T, L)
         return GenerationResult(
             sequences=x,
             steps_taken=steps_taken,
             block_sizes=block_sizes,
             unmask_order=unmask_order,
+            state_history=state_history,
+            x0_history=x0_history,
         )
 
 
