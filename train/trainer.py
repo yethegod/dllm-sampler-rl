@@ -3,7 +3,9 @@
 # Copyright (C) 2026 Apple Inc. All Rights Reserved.
 #
 ### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+import contextlib
 import gc
+import inspect
 import json
 import os
 import warnings
@@ -28,6 +30,8 @@ from transformers import TrainerCallback
 from trl.data_utils import is_conversational
 from trl.data_utils import maybe_apply_chat_template
 from trl.models import unwrap_model_for_generation
+from common.models.policy import HIDDEN_POLICY_TYPES
+from common.models.policy import REPLAYABLE_POLICY_TYPES
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.utils import print_prompt_completions_sample
@@ -111,6 +115,41 @@ class Trainer(GRPOTrainer):
             f"per_device_train_batch_size * num_processes "
             f"({self.args.per_device_train_batch_size} * {self.accelerator.num_processes})."
         )
+
+        # Replay the policy's per-timestep inputs in compute_loss instead of buffering
+        # them from the rollout. Worth it exactly when the buffer is the (B,T,L,d_model)
+        # one, and mandatory once the dLLM is trainable, since its activations cannot be
+        # stored across timesteps at all.
+        if self.args.replay_policy_inputs is not None:
+            self.replay_policy_inputs = self.args.replay_policy_inputs
+        else:
+            self.replay_policy_inputs = (
+                self.args.train_dllm
+                or self.args.policy_type in REPLAYABLE_POLICY_TYPES
+            )
+        if self.replay_policy_inputs:
+            # Refuse rather than silently buffer: the block_policy decode path fills its
+            # own rec_c and would ignore the flag, which looks like it worked.
+            assert self.args.policy_type in REPLAYABLE_POLICY_TYPES, (
+                "replay_policy_inputs is only implemented for the per-step hidden "
+                f"policies {REPLAYABLE_POLICY_TYPES}, got "
+                f"policy_type={self.args.policy_type!r}. The block_policy path records "
+                "one decision per block, so its buffer is ~30x smaller and does not "
+                "need replaying."
+            )
+            # The ES branch builds its own rollout and never records a state history.
+            assert not self.args.es_thresholds, (
+                "expert steering (es_thresholds) with replay_policy_inputs is not "
+                "implemented; the ES rollout records no state history to replay"
+            )
+        if self.args.train_dllm:
+            # The loss path is correct for a trainable backbone, but nothing here puts
+            # 8B of parameters into the optimizer or shards their Adam state.
+            raise NotImplementedError(
+                "train_dllm=True makes compute_loss propagate gradients into the dLLM, "
+                "but the optimizer/sharding side is not wired up (8B of Adam state "
+                "needs ZeRO/FSDP or LoRA). Remove the flag or implement that first."
+            )
 
         # Track recent rewards for best checkpoint saving
         self.train_reward_queue = deque(
@@ -230,6 +269,27 @@ class Trainer(GRPOTrainer):
         batch_index_start = 0
         loss_acummulator = 0
         entropy_accumulator = []
+
+        # Every (batch, timestep-chunk) pair is backwarded as soon as it is computed, so
+        # no chunk's activations outlive it -- with a 4096-wide policy input those are
+        # what dominate memory, and holding all of them until one backward at the end is
+        # what made the per-step hidden policy OOM. The loss is a plain sum over
+        # timesteps (the GRPO ratio is per-timestep, not per-trajectory), so splitting
+        # the backward this way is exactly equivalent.
+        #
+        # The last chunk is handed back to Trainer.training_step instead, so accelerate
+        # still owns the final backward and DDP reduces exactly once. With a single
+        # chunk nothing is backwarded here and the path is bit-identical to before.
+        group_size = sum(group_batch_sizes)
+
+        def _chunk_count(policy_output):
+            t = policy_output["sampling_masks"].size(1)
+            bs = self.args.timestep_batch_size or t
+            return (t + bs - 1) // bs
+
+        total_chunks = sum(_chunk_count(po) for po in policy_outputs)
+        chunks_done = 0
+        final_chunk_loss = None
         for batch_idx, batch_policy_output in enumerate(policy_outputs):
             batch_sampling_masks = batch_policy_output[
                 "sampling_masks"
@@ -242,13 +302,16 @@ class Trainer(GRPOTrainer):
 
             B, T, _ = batch_sampling_masks.shape
 
-            time_step_loss_accumulator = torch.zeros(
-                B, device=batch_sampling_masks.device
-            )  # (B,)
             timestep_bs = (
                 self.args.timestep_batch_size
                 if self.args.timestep_batch_size is not None
                 else T
+            )
+            # Hoisted: the per-chunk loss below needs the same normaliser the whole
+            # batch used, and it is a function of the full mask, which is already here.
+            num_active_steps = batch_sampling_masks.any(dim=-1).sum(dim=-1)  # (B,)
+            assert (num_active_steps > 0).all(), (
+                "At least one batch element was active for < 1 steps?"
             )
             for time_step_idx in range(0, T, timestep_bs):
                 # Get this batch's data
@@ -260,6 +323,16 @@ class Trainer(GRPOTrainer):
                 ]
 
                 ### Prepare time-batched inputs
+                # A None slot is the hidden stream the rollout did not buffer; recompute
+                # exactly this chunk's worth and let it die with the chunk's backward.
+                replayed_hidden = None
+                if batch_policy_output.get("state_history") is not None:
+                    replayed_hidden = self._replay_hidden_states(
+                        batch_policy_output,
+                        time_step_idx,
+                        time_step_idx + timestep_bs,
+                    )
+
                 time_step_batch_policy_inputs = []
                 for ptdi in batch_policy_output["policy_inputs"]:
                     if isinstance(ptdi, torch.Tensor):
@@ -275,6 +348,12 @@ class Trainer(GRPOTrainer):
                         )  # at time_dim get only what belongs to this time-batch
 
                         time_step_batch_policy_inputs.append(ptdi[tuple(slices)])
+                    elif ptdi is None:
+                        assert replayed_hidden is not None, (
+                            "policy_inputs has an empty slot but the rollout recorded no "
+                            "state_history to replay it from"
+                        )
+                        time_step_batch_policy_inputs.append(replayed_hidden)
                     else:
                         # Non-tensors just get propagated
                         time_step_batch_policy_inputs.append(ptdi)
@@ -337,9 +416,23 @@ class Trainer(GRPOTrainer):
                 per_timestep_loss *= time_step_batch_sampling_masks.any(dim=-1).to(
                     per_timestep_loss.dtype
                 )
-                time_step_loss_accumulator += per_timestep_loss.sum(dim=-1)
+                # Same normalisation the whole-batch reduction used to apply, just
+                # applied per chunk: sum over this chunk's timesteps, divide by the
+                # batch element's active-step count, then by the group size.
+                chunk_loss = (
+                    -(per_timestep_loss.sum(dim=-1) / num_active_steps).sum()
+                    / group_size
+                )
+                chunks_done += 1
+                if chunks_done < total_chunks:
+                    with self.accelerator.no_sync(model):
+                        self.accelerator.backward(chunk_loss)
+                else:
+                    final_chunk_loss = chunk_loss
+                loss_acummulator = loss_acummulator + chunk_loss.detach()
 
                 del (
+                    chunk_loss,
                     logps_timestep,
                     coeff_1,
                     coeff_2,
@@ -349,16 +442,6 @@ class Trainer(GRPOTrainer):
                 )
                 torch.cuda.empty_cache()
 
-            num_active_steps = batch_sampling_masks.any(dim=-1).sum(dim=-1)  # (B,)
-            assert (num_active_steps > 0).all(), (
-                "At least one batch element was active for < 1 steps?"
-            )
-            batch_loss = time_step_loss_accumulator / num_active_steps
-
-            # The accumulated loss is updated per the sum of -batch_loss
-            # (we later turn the sum into a mean by dividing by the group size)
-            loss_acummulator -= batch_loss.sum()
-
             # Next batch starts where the current one left off
             batch_index_start = batch_index_end
 
@@ -366,8 +449,11 @@ class Trainer(GRPOTrainer):
             f"TODO non-zero {self.beta=} not supported at this time"
         )
 
-        # final loss is average over the group
-        loss = loss_acummulator / sum(group_batch_sizes)
+        # Already normalised per chunk. The returned tensor carries only the final
+        # chunk's graph -- every earlier chunk was backwarded above -- while the added
+        # constant makes its value the whole loss, which is what gets logged.
+        assert final_chunk_loss is not None, "compute_loss produced no chunks"
+        loss = final_chunk_loss + (loss_acummulator - final_chunk_loss.detach())
 
         # Log entropy if collected
         if entropy_accumulator:
@@ -377,6 +463,53 @@ class Trainer(GRPOTrainer):
             )
 
         return loss
+
+    def _replay_hidden_states(self, batch_policy_output, t_start, t_end):
+        """Recompute the dLLM hidden states the policy saw at timesteps [t_start, t_end).
+
+        The rollout stored the (B,T,L) token state instead of the (B,T,L,d_model) hidden
+        states -- about 2000x smaller -- and the dLLM is deterministic given its input,
+        so running it over that state reproduces them exactly. One forward per timestep,
+        B sequences at a time: batching the whole chunk into B*t rows would materialise a
+        vocab-sized logit tensor t times over, which is what the buffer was avoiding.
+
+        :return: (B, t_end - t_start, L, d_model)
+        """
+        state = batch_policy_output["state_history"][:, t_start:t_end]  # (B, t, L)
+        prompt_ids = batch_policy_output["prompt_ids"]  # (B, P)
+        prompt_mask = batch_policy_output["prompt_mask"]  # (B, P)
+        P = prompt_ids.size(1)
+
+        # Same mask generate_unified builds: real prompt mask, then ones over the
+        # generation region.
+        attn = torch.ones(
+            (state.size(0), P + state.size(-1)),
+            dtype=torch.float,
+            device=state.device,
+        )
+        attn[:, :P] = prompt_mask.float()
+        attn = attn.to(self.dllm.dtype)
+
+        hidden_kwargs = {}
+        if "final_hidden_state_only" in inspect.signature(self.dllm.forward).parameters:
+            hidden_kwargs["final_hidden_state_only"] = True
+
+        # Frozen backbone => no graph to keep. Flipping train_dllm makes the same
+        # forward differentiable, which is the whole point of replaying rather than
+        # buffering: backbone activations could never have been stored across T.
+        ctx = contextlib.nullcontext() if self.args.train_dllm else torch.no_grad()
+        out = []
+        with ctx:
+            for k in range(state.size(1)):
+                x = torch.cat([prompt_ids, state[:, k]], dim=1)
+                model_output = self.dllm(
+                    x,
+                    attention_mask=attn,
+                    output_hidden_states=True,
+                    **hidden_kwargs,
+                )
+                out.append(model_output.hidden_states[-1][:, P:, :].contiguous())
+        return torch.stack(out, dim=1)
 
     def _get_per_timestep_logps_block(
         self,
@@ -655,6 +788,7 @@ class Trainer(GRPOTrainer):
                         confidences_top_p=self.args.confidences_top_p,
                         model_type=self.args.model_type,
                         attention_mask=batch_prompt_mask,
+                        replay_policy_inputs=self.replay_policy_inputs,
                         **extra_kwargs,
                     )
                     if is_block_policy:
@@ -685,6 +819,11 @@ class Trainer(GRPOTrainer):
                             "prompt_length": batch_prompt_ids.shape[1],
                             "sampling_inputs": batch_sampling_inputs,
                             "policy_inputs": batch_policy_inputs,
+                            # Replay keys: the (B,T,L) token state the policy saw, plus
+                            # what it takes to rebuild the full sequence and mask.
+                            "state_history": result.state_history,
+                            "prompt_ids": batch_prompt_ids,
+                            "prompt_mask": batch_prompt_mask,
                         }
                     )
                     num_steps_all.append(num_steps)

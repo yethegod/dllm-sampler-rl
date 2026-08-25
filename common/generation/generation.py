@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from common.generation.sampling import bernoulli_sample
 from common.generation.sampling import categorical_sample
 from common.generation.sampling import dpls_sample
+from common.models.policy import HIDDEN_POLICY_TYPES
 
 
 class GenerationResult(NamedTuple):
@@ -27,6 +28,10 @@ class GenerationResult(NamedTuple):
     # (B, L) step index at which each generated position was unmasked, -1 if never
     # (only populated when record_unmask_order=True)
     unmask_order: torch.Tensor | None = None
+    # (B,T,L) generation-region tokens as they stood at each recorded decision,
+    # only populated when replay_policy_inputs=True. This is what compute_loss
+    # replays through the dLLM instead of buffering (B,T,L,d_model) hidden states.
+    state_history: torch.Tensor | None = None
 
     # Realized joint actions, one row per rollout (remasking='block_policy' only).
     # Padded to T with sampling_masks marking the real decisions.
@@ -66,6 +71,7 @@ def generate_unified(
     delimiter_ids: tuple[int, ...] = (198,),
     delimiter_threshold: float = 0.3,
     record_unmask_order: bool = False,
+    replay_policy_inputs: bool = False,
     block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
     threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
     block_schedule: tuple[tuple[int, float], ...] | None = None,
@@ -141,6 +147,7 @@ def generate_unified(
     sampling_history = [] if record_policy_data else None
 
     # (B, L) step at which each position was unmasked; -1 while still masked
+    state_history = None
     unmask_order = (
         torch.full((B, L), -1, dtype=torch.int32, device=x.device)
         if record_unmask_order
@@ -174,11 +181,7 @@ def generate_unified(
     # The hidden-state policies read model_output.hidden_states[-1]; the confidence
     # policies never touch it. Both decode paths below branch on this, so a new hidden
     # policy missing from this tuple fails as `NoneType` far from the config.
-    wants_hidden = policy_type in (
-        "dit_hidden",
-        "dit_hidden_proj",
-        "dit_block_size_hidden_proj",
-    )
+    wants_hidden = policy_type in HIDDEN_POLICY_TYPES
 
     # This repo's modeling_llada.py adds final_hidden_state_only, which skips
     # collecting the 32 per-layer hidden states nobody reads (~1.9 GiB/forward at
@@ -186,6 +189,11 @@ def generate_unified(
     # through the Hub config's auto_map, so the class actually loaded is the Hub's
     # copy, not the vendored one -- and Dream never had the kwarg. Ask the model
     # rather than assume: passing it blind is a TypeError on the first forward.
+    # Replaying only makes sense for the policies whose recorded input is the huge
+    # one; for the confidence policies the buffer is a few MB and replaying would
+    # buy nothing for an extra dLLM forward per timestep.
+    record_state = replay_policy_inputs and wants_hidden
+
     hidden_kwargs = {}
     if wants_hidden:
         try:
@@ -230,6 +238,20 @@ def generate_unified(
 
         return model_output, probs, x0
 
+    def _record(sampling_data):
+        """Append one timestep's policy record, swapping the buffer for a replay key.
+
+        When replaying, the (B,L,d_model) hidden slot is replaced by the (B,L) token
+        state it is a deterministic function of -- 2000x smaller -- and compute_loss
+        runs the dLLM over that state to get the same hidden states back. x has not
+        been updated for this step yet, so this is exactly what the policy just saw.
+        """
+        if record_state:
+            pi = sampling_data["policy_inputs"]
+            sampling_data["policy_inputs"] = (pi[0], None, *pi[2:])
+            sampling_data["state"] = x[:, prompt_L:].clone()
+        sampling_history.append(sampling_data)
+
     def _step_decision(
         mask_index, block_mask_index, block_slice, model_output, probs, x0
     ):
@@ -253,7 +275,7 @@ def generate_unified(
                 dpls_stop_logit,
                 temperature_policy,
             )
-            sampling_history.append(sampling_data)
+            _record(sampling_data)
 
         elif remasking == "fastdllm":
             unmask = _confidence_threshold_unmask(
@@ -276,7 +298,7 @@ def generate_unified(
                     temperature_policy,
                     unmask,
                 )
-                sampling_history.append(sampling_data)
+                _record(sampling_data)
 
         else:  # low_confidence / random
             unmask = _fixed_step_unmask_decisions(
@@ -621,11 +643,17 @@ def generate_unified(
                 [h["sampling_masks"] for h in sampling_history], dim=1
             )
 
-            # Stack policy inputs
+            # Stack policy inputs. A None column is the hidden slot that _record
+            # swapped out; compute_loss fills it back in from state_history.
             policy_input_columns = zip(*[h["policy_inputs"] for h in sampling_history])
             policy_inputs_result = tuple(
-                torch.stack(col, dim=1) for col in policy_input_columns
+                None if col[0] is None else torch.stack(col, dim=1)
+                for col in policy_input_columns
             )
+            if record_state:
+                state_history = torch.stack(
+                    [h["state"] for h in sampling_history], dim=1
+                )  # (B, T, L)
         else:
             sampling_inputs = samples = sampling_masks = None
             policy_inputs_result = None
@@ -640,6 +668,7 @@ def generate_unified(
             still_masked=still_masked,
             block_sizes=block_sizes,
             unmask_order=unmask_order,
+            state_history=state_history,
         )
     else:
         return GenerationResult(
@@ -738,7 +767,7 @@ def _compute_policy_logits(
         topk_result.values if full_context else topk_result.values[:, block_slice]
     )
 
-    if policy_type in ("dit_hidden", "dit_hidden_proj"):
+    if policy_type in HIDDEN_POLICY_TYPES:
         hidden_states = model_output.hidden_states[-1]
         # .contiguous() is load-bearing, not tidiness. record_policy_data keeps one of
         # these per timestep, and a slice is a view that pins its whole (B, prompt+gen,

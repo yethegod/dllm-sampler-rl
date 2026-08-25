@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96g
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=smoke-hidden-proj
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -30,8 +30,9 @@
 # measures what each of the 8 would use. generation_batch_size tracks pdbs to keep
 # gbs == pdbs * num_processes on one GPU (the trainer asserts this). Each config keeps
 # its own num_generations (8 per-step, 16 block_policy), and both divide their pdbs.
-# ARMS=hidden_proj sbatch ... reruns a single arm; PDBS_PER_STEP / PDBS_BLOCK
-# override the per-arm batch size.
+# ARMS='<names>' sbatch ... selects arms; PDBS_PER_STEP / PDBS_BLOCK override the
+# per-arm batch size. Default runs all four; the two chunk_control_* arms are the A/B
+# for the chunk-wise backward and are cheap.
 #
 # 1 GPU => accelerate takes the simple launcher: no rendezvous, no port 29500
 # collision with co-scheduled jobs (that constraint only bites eval.pipeline).
@@ -58,7 +59,7 @@ git -C "$REPO" log -1 --format='%h %s'
 SUMMARY=()
 
 run_arm() {
-  local name=$1 config=$2 pdbs=$3
+  local name=$1 config=$2 pdbs=$3 extra=${4:-}
   case " ${ARMS:-hidden_proj blocksize_hidden_proj} " in
     *" $name "*) ;;
     *) return 0 ;;
@@ -85,7 +86,8 @@ run_arm() {
     --generation_batch_size "$pdbs" \
     --max_steps 10 \
     --save_steps 500 \
-    --warmup_steps 2
+    --warmup_steps 2 \
+    $extra
   local rc=$?
 
   kill "$smi" 2>/dev/null
@@ -95,17 +97,30 @@ run_arm() {
   SUMMARY+=("$line")
 }
 
-# Asymmetric on purpose (job 21410797): block_policy fits at the real pdbs 16 with
-# ~11 GiB to spare, but the per-step path OOM'd there at 40.1 GiB -- its buffer is one
-# (B,L,4096) slice per forward and T runs to max_steps=L=256 for an untrained policy,
-# where a trained BL128 policy takes ~134. Memory is linear in pdbs, so 8 halves it.
+# Back to the real pdbs 16, which OOM'd at 40.1 GiB before replay (job 21410797): the
+# rollout no longer buffers (B,T,L,4096) hidden states, and compute_loss backwards each
+# timestep chunk instead of holding all of them for one backward at the end. Expect the
+# peak to land near 25 GiB rather than the ~56 GiB the old path needed here.
 run_arm hidden_proj \
   configs/experiment_configs/llada_8b_instruct_dit_hidden_proj_BL32_mixture.yaml \
-  "${PDBS_PER_STEP:-8}"
+  "${PDBS_PER_STEP:-16}"
 
 run_arm blocksize_hidden_proj \
   configs/experiment_configs/llada_8b_instruct_dit_blocksize_joint_hidden_proj.yaml \
   "${PDBS_BLOCK:-16}"
+
+# Control pair. Chunk-wise backward changes the order gradients accumulate in, so it is
+# mathematically equivalent but not bit-identical, and it now applies to the confidence
+# policies every existing run uses. These two differ ONLY in the number of chunks
+# (unset => one chunk => the pre-change path; 8 => ~32 chunks => the new one), same
+# config and same seed, so any drift in loss/grad_norm between them is the change
+# itself rather than run-to-run noise.
+run_arm chunk_control_off \
+  configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.yaml 16
+
+run_arm chunk_control_on \
+  configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.yaml 16 \
+  "--timestep_batch_size 8"
 
 echo
 echo "=== summary ==="

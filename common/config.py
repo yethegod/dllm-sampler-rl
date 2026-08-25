@@ -208,6 +208,29 @@ class Config(GRPOConfig):
         },
     )
 
+    train_dllm: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the dLLM itself is trained alongside the policy. False (the "
+            "default, and what every experiment so far assumes) keeps it frozen, so the "
+            "replay forward in compute_loss runs under no_grad. Setting this True makes "
+            "the loss path correct for a trainable backbone, but the optimizer and "
+            "sharding side is NOT wired up -- 8B of Adam state needs ZeRO/FSDP or LoRA."
+        },
+    )
+
+    replay_policy_inputs: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Recompute the policy's per-timestep inputs in compute_loss instead of "
+            "buffering them from the rollout. None (default) decides automatically: on for "
+            "the hidden-state policies, whose (B,T,L,d_model) buffer dominates memory, and "
+            "for train_dllm (where backbone activations cannot be stored at all); off for "
+            "the confidence policies, whose buffer is a few MB and for which replaying "
+            "would cost extra dLLM forwards for nothing."
+        },
+    )
+
     timestep_batch_size: Optional[int] = field(
         default=None,
         metadata={

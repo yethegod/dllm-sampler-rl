@@ -12,6 +12,27 @@ from common.models.policy_layers import RoPEDiTBlock
 from common.models.policy_layers import sinusoidal_time_embedding
 
 
+# The policy types whose per-position input is the dLLM's last-layer hidden state.
+# generate_unified branches on this to request output_hidden_states, and the trainer
+# uses it to decide whether the rollout buffer is big enough to be worth replaying.
+# Keep new hidden policies here rather than repeating the tuple at each use site.
+HIDDEN_POLICY_TYPES = (
+    "dit_hidden",
+    "dit_hidden_proj",
+    "dit_block_size_hidden_proj",
+)
+
+# Of those, the ones whose rollout record can be replayed from a token state instead of
+# buffered. The block_policy decode path writes its own decision-indexed rec_c buffer
+# rather than going through generate_unified's per-step recorder, so replay is not
+# implemented for it -- and it does not need it: it records one decision per block
+# (T ~ 8) where the per-step policies record one per forward (T up to 256).
+REPLAYABLE_POLICY_TYPES = (
+    "dit_hidden",
+    "dit_hidden_proj",
+)
+
+
 class PolicyConfig(PretrainedConfig):
     model_type = "policy"
 
