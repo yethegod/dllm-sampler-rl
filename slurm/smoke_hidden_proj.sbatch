@@ -60,7 +60,9 @@ SUMMARY=()
 
 run_arm() {
   local name=$1 config=$2 pdbs=$3 extra=${4:-}
-  case " ${ARMS:-hidden_proj blocksize_hidden_proj} " in
+  # Keep in sync with the run_arm calls below -- an arm missing from this default
+  # is silently skipped, which is how job 21447593 ran two arms instead of four.
+  case " ${ARMS:-hidden_proj blocksize_hidden_proj chunk_control_off chunk_control_on} " in
     *" $name "*) ;;
     *) return 0 ;;
   esac
