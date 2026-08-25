@@ -30,7 +30,8 @@
 # measures what each of the 8 would use. generation_batch_size tracks pdbs to keep
 # gbs == pdbs * num_processes on one GPU (the trainer asserts this). Each config keeps
 # its own num_generations (8 per-step, 16 block_policy), and both divide their pdbs.
-# ARMS=hidden_proj sbatch ... reruns a single arm.
+# ARMS=hidden_proj sbatch ... reruns a single arm; PDBS_PER_STEP / PDBS_BLOCK
+# override the per-arm batch size.
 #
 # 1 GPU => accelerate takes the simple launcher: no rendezvous, no port 29500
 # collision with co-scheduled jobs (that constraint only bites eval.pipeline).
@@ -51,6 +52,8 @@ cd "$REPO"
 
 echo "=== GPU ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv
+echo "=== commit ==="
+git -C "$REPO" log -1 --format='%h %s'
 
 SUMMARY=()
 
@@ -70,7 +73,7 @@ run_arm() {
   mkdir -p "$outdir"
 
   echo
-  echo "############ ARM: $name ############"
+  echo "############ ARM: $name (pdbs=$pdbs) ############"
   nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -l 5 > "$memlog" &
   local smi=$!
 
@@ -87,7 +90,7 @@ run_arm() {
 
   kill "$smi" 2>/dev/null
   wait "$smi" 2>/dev/null
-  local line="RESULT $name: exit=$rc peak_gpu_mem=$(sort -n "$memlog" | tail -1) MiB"
+  local line="RESULT $name: pdbs=$pdbs exit=$rc peak_gpu_mem=$(sort -n "$memlog" | tail -1) MiB"
   echo "$line"
   SUMMARY+=("$line")
 }
@@ -97,10 +100,12 @@ run_arm() {
 # (B,L,4096) slice per forward and T runs to max_steps=L=256 for an untrained policy,
 # where a trained BL128 policy takes ~134. Memory is linear in pdbs, so 8 halves it.
 run_arm hidden_proj \
-  configs/experiment_configs/llada_8b_instruct_dit_hidden_proj_BL32_mixture.yaml 8
+  configs/experiment_configs/llada_8b_instruct_dit_hidden_proj_BL32_mixture.yaml \
+  "${PDBS_PER_STEP:-8}"
 
 run_arm blocksize_hidden_proj \
-  configs/experiment_configs/llada_8b_instruct_dit_blocksize_joint_hidden_proj.yaml 16
+  configs/experiment_configs/llada_8b_instruct_dit_blocksize_joint_hidden_proj.yaml \
+  "${PDBS_BLOCK:-16}"
 
 echo
 echo "=== summary ==="
