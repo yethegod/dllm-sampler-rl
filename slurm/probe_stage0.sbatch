@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96g
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=probe-stage0
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -33,15 +33,20 @@
 #                      projector, the replay path, and the retuning that comes with them.
 #   hidden >  both     the bet is live, and a dense-label warm-start has signal to teach.
 #
-# Batch size 8 keeps one forward's logits at ~0.5 GiB; the job does one decode pass plus
-# one replay pass per batch, so roughly 2 * NFE forwards per batch (Fast-dLLM at 0.9
-# measures ~81 NFE on GSM8K).
+# Sizing, corrected after the first run (jobs 21449052 / 21449753). That run collected
+# 438k rows from only 88 examples and the 4096-d probe overfit at the example level:
+# rows inside one generation share a trajectory, so the effective sample size is the
+# number of EXAMPLES, not rows. This one trades rows for examples -- 384 examples,
+# replaying every 4th step -- which costs about the same GPU time because the replay
+# pass shrinks by the same factor. Fast-dLLM at 0.9 takes T=205-255 steps at
+# block_length 32 (not the 81 recorded at block_length 128), so a batch is roughly
+# T + T/4 forwards.
 
 set -euo pipefail
 
 REPO=/u/zsun9/dllm-sampler-rl
 WORK=/work/hdd/bhta/zsun9
-OUT=$WORK/probe_data/gsm8k_t09.npz
+OUT=$WORK/probe_data/${TAG:-gsm8k_t09_wide}.npz
 
 source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
 conda activate dllm
@@ -58,16 +63,21 @@ echo "=== commit ==="
 git -C "$REPO" log -1 --format='%h %s'
 
 echo
+if [ -n "${SKIP_COLLECT:-}" ] && [ -f "$OUT" ]; then
+  echo "############ collect: skipped, reusing $OUT ############"
+else
 echo "############ collect ############"
 python -u -m eval.collect_probe_data \
   --config configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.yaml \
   --dataset "${DATASET:-gsm8k}" \
-  --n_test "${N_TEST:-128}" \
-  --batch_size 8 \
+  --n_test "${N_TEST:-384}" \
+  --batch_size "${BATCH_SIZE:-16}" \
   --thres "${THRES:-0.9}" \
-  --rows_per_step "${ROWS_PER_STEP:-192}" \
+  --step_stride "${STEP_STRIDE:-4}" \
+  --rows_per_step "${ROWS_PER_STEP:-96}" \
   --out "$OUT"
+fi
 
 echo
 echo "############ fit probes ############"
-python -u -m eval.fit_probes --data "$OUT"
+python -u -m eval.fit_probes --data "$OUT" --epochs "${EPOCHS:-400}"

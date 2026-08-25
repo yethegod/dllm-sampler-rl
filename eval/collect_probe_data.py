@@ -73,6 +73,15 @@ def main():
         "step, so late steps -- which have few masks left -- contribute everything they "
         "have and early steps are subsampled.",
     )
+    parser.add_argument(
+        "--step_stride",
+        type=int,
+        default=1,
+        help="Replay only every k-th recorded step. Decoding still costs T forwards but "
+        "the replay pass drops to T/k, which is what buys the example count that "
+        "actually determines the probe's effective sample size. Adjacent steps differ "
+        "by a handful of tokens anyway.",
+    )
     parser.add_argument("--max_rows", type=int, default=400_000)
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
@@ -150,7 +159,7 @@ def main():
             # "ran out of steps", not "unsafe". Drop those columns entirely.
             decided = final_gen != mask_id  # (B, L)
 
-            for t in range(T):
+            for t in range(0, T, args.step_stride):
                 masked = (state_hist[:, t] == mask_id) & decided  # (B, L)
                 if not masked.any():
                     continue
@@ -182,7 +191,8 @@ def main():
 
             example_offset += B
             print(
-                f"batch {bi}: T={T} rows so far {n_rows}", flush=True
+                f"batch {bi}: T={T} examples {example_offset} rows so far {n_rows}",
+                flush=True,
             )
 
     out = dict(
