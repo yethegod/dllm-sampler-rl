@@ -12,19 +12,24 @@
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
 #SBATCH --mail-user=sun01024@umn.edu
 
-# 10-step single-GPU smoke test for the two hidden-state-input policies (10f36eb).
-# Everything so far was verified against a toy LLaDA on the login node; this is the
-# first run of these policies against the real 8B model. What it must show:
-#   - both decode paths run and the loss backward reaches the projector
-#   - peak GPU memory near the estimate: ~25.5 GiB for the per-step path (16.0
-#     weights + 2.9 logits + 1.9 all-33-layer hidden states + 4.2 policy_inputs
-#     buffer + 0.5 chunked fp32 cast), and less for block_policy, whose rec_c is
-#     capped at T_cap=32 decisions rather than T~134 forwards
-#   - timestep_batch_size:8 is actually taking effect: unset, compute_loss casts the
-#     whole (B,T,L,4096) buffer to fp32 at once, +8 GiB, which would not fit here.
-#     The 1.9 GiB for the unused per-layer hidden states is NOT saved -- LLaDA loads
-#     from the Hub's modeling_llada, which has no final_hidden_state_only (job
-#     21410511 crashed on exactly that); generate_unified now signature-checks it.
+# 10-step single-GPU smoke test for the hidden-state-input policies and for the
+# chunk-wise backward they needed. Toy-LLaDA tests on the login node cover the rollout
+# recording and prove replay reproduces the buffered hidden states bit-identically, but
+# they cannot reach compute_loss; that is what this measures. Last measured (jobs
+# 21447593 and 21448488, one A100-40GB):
+#
+#   hidden_proj            pdbs 16 -> 27259 MiB   (was OOM at 40095 before replay)
+#   blocksize_hidden_proj  pdbs 16 -> 28547 MiB   (unaffected; still buffers rec_c)
+#   chunk_control_off      pdbs 16 -> 39177 MiB   (one chunk = the pre-change path)
+#   chunk_control_on       pdbs 16 -> 23641 MiB   (~32 chunks)
+#
+# The per-step arm no longer buffers (B,T,L,4096) hidden states at all -- the rollout
+# records the (B,T,L) token state and compute_loss replays the dLLM over it -- and each
+# timestep chunk is backwarded as it is computed, so timestep_batch_size now bounds the
+# peak rather than just the working set. Note the ~1.9 GiB of unread per-layer hidden
+# states is still NOT saved: LLaDA resolves to the Hub's modeling_llada, which has no
+# final_hidden_state_only (job 21410511 crashed on exactly that), so generate_unified
+# signature-checks the kwarg and today that check is False.
 #
 # Per-GPU memory depends on per_device_train_batch_size, not on world size, so one GPU
 # measures what each of the 8 would use. generation_batch_size tracks pdbs to keep
