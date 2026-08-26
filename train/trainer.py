@@ -210,9 +210,8 @@ class Trainer(GRPOTrainer):
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         """Override training_step to skip optimizer step when advantages are zero."""
-        # Check if all advantages are zero (no learning signal)
-        if "advantages" in inputs and torch.abs(inputs["advantages"]).max() < 1e-6:
-            # Skip expensive forward/backward passes - no learning signal
+        if self._skip_step_globally(inputs):
+            # Skip expensive forward/backward passes - no learning signal anywhere
             return torch.tensor(0.0, device=inputs["advantages"].device)
 
         # Track effective training steps (non-zero advantages)
@@ -221,11 +220,42 @@ class Trainer(GRPOTrainer):
         # Normal training step for non-zero advantages
         return super().training_step(model, inputs, num_items_in_batch)
 
+    def _skip_step_globally(self, inputs: dict[str, Any]) -> bool:
+        """Do *all* ranks agree this step carries no learning signal?
+
+        ``advantages`` is this rank's slice (see ``_generate_and_score_completions``),
+        so the local answer differs between ranks whenever one rank's groups happened
+        to collapse and another's did not. A rank that returned early while another
+        entered backward would leave the others waiting on a collective that never
+        comes, so the decision has to be taken jointly: skip only if *every* rank is
+        signal-free, and note that the gather below is itself a collective -- every
+        rank must reach it, which is why it is unconditional on the value.
+        """
+        if "advantages" not in inputs:
+            # Nothing to agree about, and calling a collective on only the ranks that
+            # happen to carry advantages is exactly the desync this guards against.
+            return False
+        advantages = inputs["advantages"]
+        has_signal = (torch.abs(advantages).max() >= 1e-6).to(torch.float32)
+        all_signals = self.accelerator.gather(has_signal.reshape(1))
+        return bool(all_signals.max().item() < 0.5)
+
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+        # This loss backwards every chunk but the last itself (see below), so it cannot
+        # run under the no-grad that Trainer.prediction_step/evaluate wrap it in: the
+        # chunk backwards would raise from inside the loop, or -- worse, with only one
+        # chunk -- silently return a graphless tensor. There is no eval loss to report
+        # anyway (beta is 0); evaluation goes through eval.eval. Fail loudly instead.
+        if not torch.is_grad_enabled():
+            raise RuntimeError(
+                "compute_loss requires grad to be enabled: it performs its own "
+                "per-chunk backward passes and has no no-grad/eval path. Evaluate "
+                "checkpoints with `python -m eval.pipeline` instead."
+            )
         # Compute the per-token log probabilities for the model
 
         model.train()
@@ -282,12 +312,18 @@ class Trainer(GRPOTrainer):
         # chunk nothing is backwarded here and the path is bit-identical to before.
         group_size = sum(group_batch_sizes)
 
-        def _chunk_count(policy_output):
-            t = policy_output["sampling_masks"].size(1)
-            bs = self.args.timestep_batch_size or t
-            return (t + bs - 1) // bs
+        # total_chunks decides which chunk is the one synchronising chunk, so it has to
+        # be counted exactly the way the loop below chunks -- an off-by-one here means
+        # either no reducing backward or two of them, i.e. a hang.
+        def _chunk_bs(t):
+            bs = self.args.timestep_batch_size if self.args.timestep_batch_size else t
+            assert bs > 0, f"{self.args.timestep_batch_size=} must be positive or None"
+            return bs
 
-        total_chunks = sum(_chunk_count(po) for po in policy_outputs)
+        total_chunks = sum(
+            -(-po["sampling_masks"].size(1) // _chunk_bs(po["sampling_masks"].size(1)))
+            for po in policy_outputs
+        )
         chunks_done = 0
         final_chunk_loss = None
         for batch_idx, batch_policy_output in enumerate(policy_outputs):
@@ -302,11 +338,7 @@ class Trainer(GRPOTrainer):
 
             B, T, _ = batch_sampling_masks.shape
 
-            timestep_bs = (
-                self.args.timestep_batch_size
-                if self.args.timestep_batch_size is not None
-                else T
-            )
+            timestep_bs = _chunk_bs(T)
             # Hoisted: the per-chunk loss below needs the same normaliser the whole
             # batch used, and it is a function of the full mask, which is already here.
             num_active_steps = batch_sampling_masks.any(dim=-1).sum(dim=-1)  # (B,)
@@ -314,133 +346,148 @@ class Trainer(GRPOTrainer):
                 "At least one batch element was active for < 1 steps?"
             )
             for time_step_idx in range(0, T, timestep_bs):
-                # Get this batch's data
-                time_step_batch_sampling_masks = batch_sampling_masks[
-                    :, time_step_idx : time_step_idx + timestep_bs, :
-                ]
-                time_step_batch_samples = batch_policy_output["samples"][
-                    :, time_step_idx : time_step_idx + timestep_bs, :
-                ]
-
-                ### Prepare time-batched inputs
-                # A None slot is the hidden stream the rollout did not buffer; recompute
-                # exactly this chunk's worth and let it die with the chunk's backward.
-                replayed_hidden = None
-                if batch_policy_output.get("state_history") is not None:
-                    replayed_hidden = self._replay_hidden_states(
-                        batch_policy_output,
-                        time_step_idx,
-                        time_step_idx + timestep_bs,
-                    )
-
-                time_step_batch_policy_inputs = []
-                for ptdi in batch_policy_output["policy_inputs"]:
-                    if isinstance(ptdi, torch.Tensor):
-                        # Find time dim and slice only at that dim
-                        time_dim = 1
-                        assert ptdi.size(time_dim) == T, (
-                            f"ptdi of shape {ptdi.shape=} did not match {T=} "
-                            f"at expected {time_dim=}"
-                        )
-                        slices = [slice(None)] * ptdi.ndim  # by default get everything
-                        slices[time_dim] = slice(
-                            time_step_idx, time_step_idx + timestep_bs
-                        )  # at time_dim get only what belongs to this time-batch
-
-                        time_step_batch_policy_inputs.append(ptdi[tuple(slices)])
-                    elif ptdi is None:
-                        assert replayed_hidden is not None, (
-                            "policy_inputs has an empty slot but the rollout recorded no "
-                            "state_history to replay it from"
-                        )
-                        time_step_batch_policy_inputs.append(replayed_hidden)
-                    else:
-                        # Non-tensors just get propagated
-                        time_step_batch_policy_inputs.append(ptdi)
-
-                logps_timestep = self._get_per_timestep_logps_block(
-                    model=model,
-                    samples=time_step_batch_samples,
-                    sampling_masks=time_step_batch_sampling_masks,
-                    policy_inputs=time_step_batch_policy_inputs,
-                    sampling_mode=self.args.sampling_mode,
-                    return_entropy=True,
-                )  # (B, timestep_bs), entropy (scalar)
-
-                if isinstance(logps_timestep, tuple):
-                    logps_timestep, entropy = logps_timestep
-                    entropy_accumulator.append(entropy)
-                else:
-                    # Backward compatibility if return_entropy=False
-                    pass
-
-                # For ES batches, adjust NEW log probabilities with mixture distribution
-                if is_es_batch:
-                    logps_timestep = torch.logaddexp(
-                        log_weight_theta + logps_timestep, log_weight_dirac
-                    )
-
-                # Get old log probabilities
-                old_logps_slice = batch_policy_output["old_per_timestep_logps"][
-                    :, time_step_idx : time_step_idx + timestep_bs
-                ].detach()
-
-                # For ES batches, adjust OLD log probabilities with mixture distribution
-                if is_es_batch:
-                    old_logps_slice = torch.logaddexp(
-                        log_weight_theta + old_logps_slice, log_weight_dirac
-                    )
-
-                coeff_1 = torch.exp(
-                    logps_timestep - old_logps_slice
-                )  # (B, timestep_bs)
-                coeff_2 = torch.clamp(
-                    coeff_1, 1 - self.args.epsilon, 1 + self.args.epsilon
-                )
-
-                # Get the advantages corresponding to this batch.
-                # Note that the "advantages" are flat of shape (G,),
-                # so we do some indexing to keep track of where the
-                # current batch is.
-                batch_advantages = (
-                    inputs["advantages"][batch_index_start:batch_index_end]
-                    .detach()
-                    .view((-1,) + (1,) * (coeff_1.ndim - 1))
-                )  # (B, 1)
-
-                per_timestep_loss1 = coeff_1 * batch_advantages
-                per_timestep_loss2 = coeff_2 * batch_advantages
-                per_timestep_loss = torch.min(per_timestep_loss1, per_timestep_loss2)
-
-                # Only include the loss for the active timesteps
-                per_timestep_loss *= time_step_batch_sampling_masks.any(dim=-1).to(
-                    per_timestep_loss.dtype
-                )
-                # Same normalisation the whole-batch reduction used to apply, just
-                # applied per chunk: sum over this chunk's timesteps, divide by the
-                # batch element's active-step count, then by the group size.
-                chunk_loss = (
-                    -(per_timestep_loss.sum(dim=-1) / num_active_steps).sum()
-                    / group_size
-                )
                 chunks_done += 1
-                if chunks_done < total_chunks:
-                    with self.accelerator.no_sync(model):
-                        self.accelerator.backward(chunk_loss)
-                else:
-                    final_chunk_loss = chunk_loss
-                loss_acummulator = loss_acummulator + chunk_loss.detach()
-
-                del (
-                    chunk_loss,
-                    logps_timestep,
-                    coeff_1,
-                    coeff_2,
-                    per_timestep_loss1,
-                    per_timestep_loss2,
-                    per_timestep_loss,
+                is_final_chunk = chunks_done == total_chunks
+                # DDP decides whether to prepare for reduction when forward() runs,
+                # not when backward() does, so this has to wrap the policy forward
+                # below. Wrapping only the backward leaves every chunk syncing.
+                #
+                # Only the final chunk syncs, and its backward is the one
+                # Trainer.training_step performs, so every rank does exactly ONE
+                # reducing backward regardless of how many chunks it has. That is
+                # load-bearing: T varies per rank with the rollout length, so a
+                # per-chunk collective would mismatch across ranks and hang.
+                sync_ctx = (
+                    contextlib.nullcontext()
+                    if is_final_chunk
+                    else self.accelerator.no_sync(model)
                 )
-                torch.cuda.empty_cache()
+                with sync_ctx:
+                    # Get this batch's data
+                    time_step_batch_sampling_masks = batch_sampling_masks[
+                        :, time_step_idx : time_step_idx + timestep_bs, :
+                    ]
+                    time_step_batch_samples = batch_policy_output["samples"][
+                        :, time_step_idx : time_step_idx + timestep_bs, :
+                    ]
+
+                    ### Prepare time-batched inputs
+                    # A None slot is the hidden stream the rollout did not buffer; recompute
+                    # exactly this chunk's worth and let it die with the chunk's backward.
+                    replayed_hidden = None
+                    if batch_policy_output.get("state_history") is not None:
+                        replayed_hidden = self._replay_hidden_states(
+                            batch_policy_output,
+                            time_step_idx,
+                            time_step_idx + timestep_bs,
+                        )
+
+                    time_step_batch_policy_inputs = []
+                    for ptdi in batch_policy_output["policy_inputs"]:
+                        if isinstance(ptdi, torch.Tensor):
+                            # Find time dim and slice only at that dim
+                            time_dim = 1
+                            assert ptdi.size(time_dim) == T, (
+                                f"ptdi of shape {ptdi.shape=} did not match {T=} "
+                                f"at expected {time_dim=}"
+                            )
+                            slices = [slice(None)] * ptdi.ndim  # by default get everything
+                            slices[time_dim] = slice(
+                                time_step_idx, time_step_idx + timestep_bs
+                            )  # at time_dim get only what belongs to this time-batch
+
+                            time_step_batch_policy_inputs.append(ptdi[tuple(slices)])
+                        elif ptdi is None:
+                            assert replayed_hidden is not None, (
+                                "policy_inputs has an empty slot but the rollout recorded no "
+                                "state_history to replay it from"
+                            )
+                            time_step_batch_policy_inputs.append(replayed_hidden)
+                        else:
+                            # Non-tensors just get propagated
+                            time_step_batch_policy_inputs.append(ptdi)
+
+                    logps_timestep = self._get_per_timestep_logps_block(
+                        model=model,
+                        samples=time_step_batch_samples,
+                        sampling_masks=time_step_batch_sampling_masks,
+                        policy_inputs=time_step_batch_policy_inputs,
+                        sampling_mode=self.args.sampling_mode,
+                        return_entropy=True,
+                    )  # (B, timestep_bs), entropy (scalar)
+
+                    if isinstance(logps_timestep, tuple):
+                        logps_timestep, entropy = logps_timestep
+                        entropy_accumulator.append(entropy.detach())
+                    else:
+                        # Backward compatibility if return_entropy=False
+                        pass
+
+                    # For ES batches, adjust NEW log probabilities with mixture distribution
+                    if is_es_batch:
+                        logps_timestep = torch.logaddexp(
+                            log_weight_theta + logps_timestep, log_weight_dirac
+                        )
+
+                    # Get old log probabilities
+                    old_logps_slice = batch_policy_output["old_per_timestep_logps"][
+                        :, time_step_idx : time_step_idx + timestep_bs
+                    ].detach()
+
+                    # For ES batches, adjust OLD log probabilities with mixture distribution
+                    if is_es_batch:
+                        old_logps_slice = torch.logaddexp(
+                            log_weight_theta + old_logps_slice, log_weight_dirac
+                        )
+
+                    coeff_1 = torch.exp(
+                        logps_timestep - old_logps_slice
+                    )  # (B, timestep_bs)
+                    coeff_2 = torch.clamp(
+                        coeff_1, 1 - self.args.epsilon, 1 + self.args.epsilon
+                    )
+
+                    # Get the advantages corresponding to this batch.
+                    # Note that the "advantages" are flat of shape (G,),
+                    # so we do some indexing to keep track of where the
+                    # current batch is.
+                    batch_advantages = (
+                        inputs["advantages"][batch_index_start:batch_index_end]
+                        .detach()
+                        .view((-1,) + (1,) * (coeff_1.ndim - 1))
+                    )  # (B, 1)
+
+                    per_timestep_loss1 = coeff_1 * batch_advantages
+                    per_timestep_loss2 = coeff_2 * batch_advantages
+                    per_timestep_loss = torch.min(per_timestep_loss1, per_timestep_loss2)
+
+                    # Only include the loss for the active timesteps
+                    per_timestep_loss *= time_step_batch_sampling_masks.any(dim=-1).to(
+                        per_timestep_loss.dtype
+                    )
+                    # Same normalisation the whole-batch reduction used to apply, just
+                    # applied per chunk: sum over this chunk's timesteps, divide by the
+                    # batch element's active-step count, then by the group size.
+                    chunk_loss = (
+                        -(per_timestep_loss.sum(dim=-1) / num_active_steps).sum()
+                        / group_size
+                    )
+                    if is_final_chunk:
+                        final_chunk_loss = chunk_loss
+                    else:
+                        self.accelerator.backward(chunk_loss)
+                    loss_acummulator = loss_acummulator + chunk_loss.detach()
+
+                    del (
+                        chunk_loss,
+                        logps_timestep,
+                        coeff_1,
+                        coeff_2,
+                        per_timestep_loss1,
+                        per_timestep_loss2,
+                        per_timestep_loss,
+                    )
+                    torch.cuda.empty_cache()
 
             # Next batch starts where the current one left off
             batch_index_start = batch_index_end
@@ -452,6 +499,10 @@ class Trainer(GRPOTrainer):
         # Already normalised per chunk. The returned tensor carries only the final
         # chunk's graph -- every earlier chunk was backwarded above -- while the added
         # constant makes its value the whole loss, which is what gets logged.
+        assert chunks_done == total_chunks, (
+            f"chunked backward ran {chunks_done} chunks but planned {total_chunks}; the "
+            "final (synchronising) chunk would be the wrong one, which deadlocks DDP"
+        )
         assert final_chunk_loss is not None, "compute_loss produced no chunks"
         loss = final_chunk_loss + (loss_acummulator - final_chunk_loss.detach())
 
