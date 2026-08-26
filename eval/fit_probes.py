@@ -18,6 +18,11 @@ Reading the result:
     hidden >  both      the hidden input has something, and a dense-label warm-start
                         has signal to teach it
 
+The input must be a schema-2 probe file, i.e. one whose rows are *actionable* positions
+(masked and inside the block being decoded) rather than every masked position. The
+check is up front and fatal: legacy files load fine and produce plausible AUCs that
+answer a different question, which is exactly the failure that is worth refusing.
+
 Limitation worth keeping in mind: this measures linear separability of a *proxy* for
 the RL objective. A gap does not guarantee an RL gain, and no gap does not strictly
 rule one out, since the real policy reads the input through a DiT rather than a linear
@@ -32,6 +37,9 @@ import argparse
 
 import numpy as np
 import torch
+
+from eval.collect_probe_data import format_provenance
+from eval.collect_probe_data import load_probe_npz
 
 
 def auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
@@ -126,7 +134,12 @@ def main():
     )
     args = parser.parse_args()
 
-    d = np.load(args.data)
+    # Refuse before a single epoch runs: a legacy (all-masked-positions) file fits
+    # perfectly happily and reports AUCs for a question nobody asked.
+    d, prov = load_probe_npz(args.data)
+    print(f"probe data: {args.data}")
+    print(format_provenance(prov))
+    print()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ex = d["example_id"]
     uniq = np.unique(ex)

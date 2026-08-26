@@ -36,6 +36,13 @@ class GenerationResult(NamedTuple):
     # populated when record_probe_data=True. Compared against the final sequence
     # it gives the dense 'was it safe to unmask position i at step t' label.
     x0_history: torch.Tensor | None = None
+    # (B,T,L) the positions the decoder could actually have acted on at each recorded
+    # step: still mask_id *and* inside the block being decoded (and the row still
+    # within its step budget). Only populated when record_probe_data=True, and indexed
+    # exactly like state_history / x0_history. A masked position outside the current
+    # block was never a candidate for that step's decision, so scoring it asks the
+    # probe a question the decoder was never allowed to answer.
+    actionable_history: torch.Tensor | None = None
 
     # Realized joint actions, one row per rollout (remasking='block_policy' only).
     # Padded to T with sampling_masks marking the real decisions.
@@ -85,6 +92,13 @@ def generate_unified(
         # Only the fixed-block loop has the recording hook; the adaptive and
         # block_policy loops would silently return nothing.
         raise ValueError("record_probe_data is not supported with adaptive_block")
+    if record_probe_data and remasking in ("block_policy", "block_schedule"):
+        # Those loops carry per-ROW block boundaries, so there is no single
+        # `block_index` to record an actionable set against, and they never reach the
+        # recording hook anyway -- failing here beats returning empty histories.
+        raise ValueError(
+            f"record_probe_data is not supported with remasking={remasking!r}"
+        )
 
     if remasking == "policy":
         if policy is None:
@@ -159,7 +173,8 @@ def generate_unified(
     # (B, L) step at which each position was unmasked; -1 while still masked
     state_history = None
     x0_history = None
-    probe_states, probe_x0 = [], []
+    actionable_history = None
+    probe_states, probe_x0, probe_actionable = [], [], []
     unmask_order = (
         torch.full((B, L), -1, dtype=torch.int32, device=x.device)
         if record_unmask_order
@@ -565,6 +580,10 @@ def generate_unified(
                     # made from and x0 is the token that decision would have committed.
                     probe_states.append(generation_part.clone())
                     probe_x0.append(x0.clone())
+                    # The candidate set this step's decision ranged over: masked, in
+                    # the current block, row still within budget. `mask_index` already
+                    # carries the first and third; `block_index` is (L,) and broadcasts.
+                    probe_actionable.append(mask_index & block_index)
                 unmask = _step_decision(
                     mask_index, block_mask_index, block_slice, model_output, probs, x0
                 )
@@ -653,6 +672,7 @@ def generate_unified(
         if record_probe_data:
             x0_history = torch.stack(probe_x0, dim=1)  # (B, T, L)
             state_history = torch.stack(probe_states, dim=1)  # (B, T, L)
+            actionable_history = torch.stack(probe_actionable, dim=1)  # (B, T, L)
 
         if sampling_history:
             # Stack all sampling data for training
@@ -691,11 +711,13 @@ def generate_unified(
             unmask_order=unmask_order,
             state_history=state_history,
             x0_history=x0_history,
+            actionable_history=actionable_history,
         )
     else:
         if record_probe_data:
             x0_history = torch.stack(probe_x0, dim=1)  # (B, T, L)
             state_history = torch.stack(probe_states, dim=1)  # (B, T, L)
+            actionable_history = torch.stack(probe_actionable, dim=1)  # (B, T, L)
         return GenerationResult(
             sequences=x,
             steps_taken=steps_taken,
@@ -703,6 +725,7 @@ def generate_unified(
             unmask_order=unmask_order,
             state_history=state_history,
             x0_history=x0_history,
+            actionable_history=actionable_history,
         )
 
 
