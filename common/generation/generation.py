@@ -903,58 +903,112 @@ def _policy_unmask_decisions(
     return unmask, sampling_data
 
 
+def _normalize_row_threshold(
+    thres: float | torch.Tensor,
+    B: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Coerce a Fast-dLLM threshold into a (row, position)-broadcastable tensor.
+
+    The comparison downstream is `(B, L) confidence > thres`, so the only shapes that
+    mean what a caller intends are:
+
+    - a Python (or NumPy) scalar, or a 0-D tensor -- the same threshold for every row;
+    - a (B, 1) tensor -- one threshold per row, what expert steering passes;
+    - a (1, 1) tensor -- a scalar with the batch axis spelled out.
+
+    A (B,) tensor is rejected on purpose: torch broadcasts it along the *position* axis,
+    comparing row r's threshold against position r of every row. That is silently wrong,
+    and it is exactly the shape reached for when "one threshold per row" is meant.
+
+    :param thres: the threshold as supplied by the caller
+    :param B: batch size of the probabilities the threshold will be compared against
+    :param device: device to place the returned threshold on; a tensor threshold that
+        arrived on another device (a CPU threshold against CUDA probabilities) is moved
+        here, keeping its dtype and shape
+    :return: a tensor of shape (B, 1) or (1, 1), on `device`
+    """
+    if not isinstance(thres, torch.Tensor):
+        return torch.as_tensor(
+            float(thres), dtype=torch.float32, device=device
+        ).reshape(1, 1)
+
+    if thres.dim() == 0:
+        return thres.reshape(1, 1).to(device)
+    if thres.dim() == 2 and thres.shape[1] == 1 and thres.shape[0] in (1, B):
+        return thres.to(device)
+
+    raise ValueError(
+        "Fast-dLLM threshold must be a scalar, a 0-D tensor, or a "
+        f"({B}, 1) tensor (one threshold per row); got shape "
+        f"{tuple(thres.shape)}. A ({B},) tensor broadcasts over positions, not "
+        "rows -- pass thres.unsqueeze(-1) if you meant one threshold per row."
+    )
+
+
 def _confidence_threshold_unmask(
     block_mask_index: torch.Tensor,
     probs: torch.Tensor,
     block_slice: slice,
     thres: float | torch.Tensor,
 ) -> torch.Tensor:
-    confidence = probs.max(dim=-1).values
+    """Fast-dLLM thresholding for a fixed, batch-shared block.
 
-    # Only consider masked positions in current block
-    confidence_masked = confidence[:, block_slice].clone()
-    confidence_masked[~block_mask_index] = -torch.inf
+    A thin adapter over _confidence_threshold_unmask_rowwise: it lifts the block-local
+    (B, BL) mask into the (B, L) block mask that function takes, so both decode paths
+    share one implementation -- and, crucially, one fallback. This used to carry its own
+    batch-wide fallback (`if not unmask_local.any()`), under which any row that cleared
+    the threshold starved every stalled row of its forced token: at B > 1 a stalled row
+    made no progress at all that step. At B = 1 the two rules coincide, so previously
+    collected baselines (all of which ran at batch size 1) are unchanged.
 
-    unmask_local = confidence_masked > thres
-    if not unmask_local.any():
-        force_idx = torch.argmax(confidence_masked, dim=-1)
-        unmask_local.scatter_(1, force_idx.unsqueeze(-1), True)
-
-    unmask = torch.zeros(
+    :param block_mask_index: (B, BL) still-masked positions inside the current block
+    :param probs: (B, L, V) next-token probabilities
+    :param block_slice: the current block, shared by every row
+    :param thres: confidence threshold; scalar, 0-D tensor, or (B, 1)
+    :return: (B, L) boolean mask of positions to unmask
+    """
+    block_index = torch.zeros(
         (probs.shape[0], probs.shape[1]), dtype=torch.bool, device=probs.device
     )
-    unmask[:, block_slice] = unmask_local
-    return unmask
+    block_index[:, block_slice] = block_mask_index
+    return _confidence_threshold_unmask_rowwise(block_index, probs, thres)
 
 
 def _confidence_threshold_unmask_rowwise(
     block_mask_index: torch.Tensor,
     probs: torch.Tensor,
-    thres: torch.Tensor,
+    thres: float | torch.Tensor,
 ) -> torch.Tensor:
-    """Row-wise Fast-dLLM thresholding for per-row block boundaries and thresholds.
+    """Row-wise Fast-dLLM thresholding, the single implementation of the rule.
 
-    Sibling of _confidence_threshold_unmask, which takes a batch-shared block slice and
-    a single threshold. Two deliberate differences:
+    Every row is treated independently:
 
-    - the block is a (B, L) mask, since every row may sit in a different block;
-    - the "nothing cleared the threshold" fallback is applied **per row**. The shared
-      version tests `if not unmask_local.any()` across the whole batch, so with B > 1 a
-      stalled row can be starved by another row that did clear. Here a stalled row would
-      never finish its block, so the fallback must be row-wise.
+    - the block is a (B, L) mask, since rows may sit in different blocks (the
+      block_policy loop) or in the same one (the fixed-block loop, via
+      _confidence_threshold_unmask);
+    - only positions inside a row's own block are eligible;
+    - the "nothing cleared the threshold" fallback fires **per row**, giving each
+      stalled row exactly one forced position -- its most confident candidate. Applied
+      batch-wide instead, a row that cleared the threshold would starve a stalled row,
+      whose block then never completes and whose decode loop spins.
 
-    The existing function is left untouched so previously collected baselines stay
-    reproducible (all of them ran at batch size 1, where the two agree).
+    A row with no eligible candidates -- finished, or its block already full -- gets no
+    action, so a committed token is never overwritten.
 
     :param block_mask_index: (B, L) still-masked positions inside each row's own block
     :param probs: (B, L, V) next-token probabilities
-    :param thres: (B, 1) per-row confidence threshold
+    :param thres: confidence threshold; scalar, 0-D tensor, or (B, 1) per-row
     :return: (B, L) boolean mask of positions to unmask
     """
+    row_thres = _normalize_row_threshold(thres, probs.shape[0], probs.device)
+
     confidence = probs.max(dim=-1).values  # (B, L)
     confidence = confidence.masked_fill(~block_mask_index, -torch.inf)
 
-    unmask = confidence > thres  # (B, L), broadcasts (B,1) over positions
+    # The second term is redundant given the -inf fill for any finite threshold, but it
+    # makes "only in-block positions are eligible" structural rather than arithmetic.
+    unmask = (confidence > row_thres) & block_mask_index  # (B,1) broadcasts over L
 
     # A row with masked positions left in its block but nothing above threshold must
     # still make progress, otherwise the block never completes and the loop spins.
