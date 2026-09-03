@@ -32,6 +32,7 @@ from common.models.policy import DiTHiddenStatePolicy
 from common.models.policy import DiTHiddenProjPolicy
 from common.models.policy import DiTBlockSizePolicy
 from common.models.policy import DiTBlockSizeHiddenProjPolicy
+from common.models.policy import DiTBlockUnmaskPolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from data.loaders.gsm8k import GSM8KDataset
@@ -119,6 +120,7 @@ def evaluate(
     block_size_candidates=(8, 16, 32, 64, 128),
     threshold_candidates=(0.5, 0.7, 0.9),
     block_schedule=None,
+    block_sampling_mode="categorical",
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -175,7 +177,7 @@ def evaluate(
                     }
                 )
 
-            if remasking in ("policy", "block_policy"):
+            if remasking in ("policy", "block_policy", "block_unmask_policy"):
                 if policy is None:
                     raise ValueError(
                         f"{remasking} remasking requires a policy to be provided"
@@ -206,11 +208,25 @@ def evaluate(
                 )
                 if remasking == "block_schedule":
                     gen_kwargs["block_schedule"] = tuple(block_schedule)
+            elif remasking == "block_unmask_policy":
+                # Block size from the policy, unmasking from its per-position head:
+                # neither block_length nor a threshold applies.
+                gen_kwargs.update(
+                    {
+                        "block_size_candidates": tuple(block_size_candidates),
+                        "block_sampling_mode": block_sampling_mode,
+                    }
+                )
 
             result = generate_unified(**gen_kwargs)
             out = result.sequences
 
-            if remasking in ("policy", "block_policy", "block_schedule"):
+            if remasking in (
+                "policy",
+                "block_policy",
+                "block_schedule",
+                "block_unmask_policy",
+            ):
                 steps_taken = result.steps_taken.tolist()
             elif remasking == "fastdllm":
                 steps_taken = [result.steps_taken.item()]
@@ -234,15 +250,20 @@ def evaluate(
             avg_block_sizes = [avg_block_size] * n_out
             action_logits = [None] * n_out
             if result.block_sizes_chosen is not None:
-                active = result.sampling_masks[..., 0]
+                active = result.block_decisions
                 n_b = len(block_size_candidates)
+                # block_policy packs [block | thres] logits; block_unmask_policy packs
+                # [unmask (L) | block] and has no thresholds.
+                has_thres = result.thresholds_chosen is not None
+                b_lo = 0 if has_thres else result.sampling_inputs.shape[-1] - n_b
                 for j in range(n_out):
                     chosen = result.block_sizes_chosen[j][active[j]].tolist()
                     block_schedules[j] = chosen
-                    thres_schedules[j] = [
-                        round(t, 4)
-                        for t in result.thresholds_chosen[j][active[j]].tolist()
-                    ]
+                    if has_thres:
+                        thres_schedules[j] = [
+                            round(t, 4)
+                            for t in result.thresholds_chosen[j][active[j]].tolist()
+                        ]
                     avg_block_sizes[j] = (
                         sum(chosen) / len(chosen) if chosen else None
                     )
@@ -250,15 +271,20 @@ def evaluate(
                     # action that got sampled. Sampling alone cannot separate "the
                     # policy conditions on this problem" from "one distribution drawn
                     # twice"; the logits can. Infeasible block sizes are -inf, which
-                    # is not valid JSON, so they go out as null.
+                    # is not valid JSON, so they go out as null. The per-position
+                    # unmask logits (L per step) are not dumped.
                     logits = result.sampling_inputs[j][active[j]].float().tolist()
                     action_logits[j] = [
                         {
                             "block": [
                                 None if not math.isfinite(v) else round(v, 4)
-                                for v in row[:n_b]
+                                for v in row[b_lo : b_lo + n_b]
                             ],
-                            "thres": [round(v, 4) for v in row[n_b:]],
+                            **(
+                                {"thres": [round(v, 4) for v in row[n_b:]]}
+                                if has_thres
+                                else {}
+                            ),
                         }
                         for row in logits
                     ]
@@ -524,6 +550,13 @@ if __name__ == "__main__":
         help="Sampling mode override (optional, uses config value if not specified)",
     )
     parser.add_argument(
+        "--block_sampling_mode",
+        type=str,
+        default=None,
+        help="Block-size sampling for --remasking block_unmask_policy: 'categorical' "
+        "or 'categorical-argmax' (optional, uses config value if not specified)",
+    )
+    parser.add_argument(
         "--adaptive_block",
         action="store_true",
         help="Use AdaBlock-style adaptive block sizes (requires batch_size 1)",
@@ -579,6 +612,8 @@ if __name__ == "__main__":
     args.grpo_config = grpo_config
     if args.sampling_mode is None:
         args.sampling_mode = grpo_config.sampling_mode
+    if args.block_sampling_mode is None:
+        args.block_sampling_mode = grpo_config.block_sampling_mode
     if args.block_length is None:
         args.block_length = grpo_config.block_length
     if args.gen_length is None:
@@ -650,7 +685,10 @@ if __name__ == "__main__":
 
     # Load the policy
     policy = None
-    if args.remasking in ("policy", "block_policy") and not args.baseline_mode:
+    if (
+        args.remasking in ("policy", "block_policy", "block_unmask_policy")
+        and not args.baseline_mode
+    ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         config = args.grpo_config
         if config.policy_type == "dit_hidden":
@@ -745,11 +783,32 @@ if __name__ == "__main__":
                 num_blocks=config.policy_num_blocks,
                 time_period=config.policy_time_period,
             ).to(device)
+        elif config.policy_type == "dit_block_unmask":
+            hidden_dim = config.policy_hidden_dim or 128
+            feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
+
+            policy_core = DiTBlockUnmaskPolicy(
+                block_size_candidates=tuple(config.block_size_candidates),
+                block_size_prior_logits=(
+                    tuple(config.block_size_prior_logits)
+                    if config.block_size_prior_logits is not None
+                    else None
+                ),
+                hidden_dim=hidden_dim,
+                feedforward_dim=feedforward_dim,
+                num_heads=config.policy_num_heads,
+                dropout=config.policy_dropout,
+                time_embed_dim=config.policy_time_embed_dim,
+                smart_init=config.policy_smart_init,
+                confidences_top_p=config.confidences_top_p,
+                num_blocks=config.policy_num_blocks,
+                time_period=config.policy_time_period,
+            ).to(device)
         else:
             raise ValueError(
                 f"Policy type {config.policy_type} not supported. "
                 "Choose from ['dit_hidden', 'dit_hidden_proj', 'dit_confidence', "
-                "'dit_block_size', 'dit_block_size_hidden_proj']"
+                "'dit_block_size', 'dit_block_size_hidden_proj', 'dit_block_unmask']"
             )
         policy = PolicyHFWrapper(policy_core, config.policy_type)
 
@@ -808,10 +867,10 @@ if __name__ == "__main__":
         mask_id=mask_id,
         model_type=_model_type,
         policy_full_context=args.grpo_config.policy_full_context
-        if args.remasking in ("policy", "block_policy")
+        if args.remasking in ("policy", "block_policy", "block_unmask_policy")
         else False,
         confidences_top_p=args.grpo_config.confidences_top_p
-        if args.remasking in ("policy", "block_policy")
+        if args.remasking in ("policy", "block_policy", "block_unmask_policy")
         else 1,
         adaptive_block=args.adaptive_block,
         delimiter_ids=args.delimiter_ids,
@@ -819,6 +878,7 @@ if __name__ == "__main__":
         block_size_candidates=tuple(args.grpo_config.block_size_candidates),
         threshold_candidates=tuple(args.grpo_config.threshold_candidates),
         block_schedule=args.block_schedule,
+        block_sampling_mode=args.block_sampling_mode,
     )
 
     if accelerator.num_processes > 1:
@@ -854,6 +914,9 @@ if __name__ == "__main__":
             args.block_length = "sched" + ",".join(
                 f"{b}:{t}" for b, t in args.block_schedule
             )
+        elif args.remasking == "block_unmask_policy":
+            # Block size and unmasking both come from the policy; no fixed length.
+            args.block_length = "blockunmask"
         results.update(
             {
                 "model_path": args.model_path,
@@ -863,8 +926,12 @@ if __name__ == "__main__":
                 "remasking": args.remasking,
                 "policy_path": args.policy_path,
                 "thres": None
-                if args.remasking in ("block_policy", "block_schedule")
+                if args.remasking
+                in ("block_policy", "block_schedule", "block_unmask_policy")
                 else args.thres,
+                "block_sampling_mode": args.block_sampling_mode
+                if args.remasking == "block_unmask_policy"
+                else None,
                 "n_test": args.n_test,
                 "few_shot": args.few_shot,
                 "adaptive_block": args.adaptive_block,

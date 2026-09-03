@@ -39,10 +39,13 @@ def load_run(json_file):
     for item in data.get("generations", []):
         blocks = item.get("block_sizes")
         thres = item.get("thresholds")
-        # Fixed-block and adaptive-block runs carry no per-block thresholds; only
-        # remasking=block_policy populates both lists, and they are index-aligned.
-        if not blocks or not thres:
+        # Only the learned block-size runs carry per-sample action lists. block_policy
+        # populates both (index-aligned); block_unmask_policy has no thresholds, so
+        # None is padded in and the threshold summaries below are skipped.
+        if not blocks or item.get("action_logits") is None:
             continue
+        if not thres:
+            thres = [None] * len(blocks)
         answer = extract_gsm_answer(item.get("generations", ""))
         samples.append(
             {
@@ -66,9 +69,10 @@ def summarize(samples):
     for s in samples:
         for i, (b, t) in enumerate(zip(s["blocks"], s["thresholds"])):
             block_hist[b] += 1
-            thres_hist[round(t, 4)] += 1
-            joint_hist[(b, round(t, 4))] += 1
             by_index[i][b] += 1
+            if t is not None:
+                thres_hist[round(t, 4)] += 1
+                joint_hist[(b, round(t, 4))] += 1
 
     n_decisions = sum(block_hist.values())
     return {
@@ -77,7 +81,11 @@ def summarize(samples):
         "nfe": sum(s["steps"] for s in samples) / n,
         "blocks_per_seq": n_decisions / n,
         "mean_block_size": sum(b * c for b, c in block_hist.items()) / n_decisions,
-        "mean_threshold": sum(t * c for t, c in thres_hist.items()) / n_decisions,
+        "mean_threshold": (
+            sum(t * c for t, c in thres_hist.items()) / n_decisions
+            if thres_hist
+            else None
+        ),
         "block_hist": block_hist,
         "thres_hist": thres_hist,
         "joint_hist": joint_hist,
@@ -98,25 +106,27 @@ def print_report(name, r):
         f"  samples {r['n_samples']}   accuracy {r['accuracy']:.2f}%   "
         f"NFE {r['nfe']:.1f}   blocks/seq {r['blocks_per_seq']:.2f}"
     )
+    mean_t = r["mean_threshold"]
     print(
         f"  mean block size {r['mean_block_size']:.1f}   "
-        f"mean threshold {r['mean_threshold']:.3f}"
+        + (f"mean threshold {mean_t:.3f}" if mean_t is not None else "no threshold axis")
     )
 
     nd = r["n_decisions"]
     print(f"\n  block size   ({nd} decisions)\n    {_pct(r['block_hist'], nd)}")
-    print(f"  threshold\n    {_pct(r['thres_hist'], nd)}")
+    if r["thres_hist"]:
+        print(f"  threshold\n    {_pct(r['thres_hist'], nd)}")
 
-    print("\n  threshold | block size   (row-normalized, blank = never chosen)")
-    sizes = sorted(r["block_hist"])
-    thresholds = sorted(r["thres_hist"])
-    print("    " + "tau \\ b".ljust(10) + "".join(f"{b:>9}" for b in sizes))
-    for t in thresholds:
-        row = f"    {t:<10.2f}"
-        for b in sizes:
-            c = r["joint_hist"].get((b, t), 0)
-            row += f"{100.0 * c / nd:>8.1f}%" if c else "        -"
-        print(row)
+        print("\n  threshold | block size   (row-normalized, blank = never chosen)")
+        sizes = sorted(r["block_hist"])
+        thresholds = sorted(r["thres_hist"])
+        print("    " + "tau \\ b".ljust(10) + "".join(f"{b:>9}" for b in sizes))
+        for t in thresholds:
+            row = f"    {t:<10.2f}"
+            for b in sizes:
+                c = r["joint_hist"].get((b, t), 0)
+                row += f"{100.0 * c / nd:>8.1f}%" if c else "        -"
+            print(row)
 
     print("\n  block size by block index   (mean, count)")
     for i in sorted(r["by_index"]):
@@ -155,7 +165,11 @@ def main():
                 "nfe": round(r["nfe"], 1),
                 "blocks_per_seq": round(r["blocks_per_seq"], 2),
                 "mean_block_size": round(r["mean_block_size"], 1),
-                "mean_threshold": round(r["mean_threshold"], 3),
+                "mean_threshold": (
+                    round(r["mean_threshold"], 3)
+                    if r["mean_threshold"] is not None
+                    else None
+                ),
                 **{
                     f"frac_b{b}": round(100.0 * c / r["n_decisions"], 1)
                     for b, c in sorted(r["block_hist"].items())

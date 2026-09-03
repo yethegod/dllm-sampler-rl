@@ -34,6 +34,7 @@ class EvalConfig:
     remasking: str = "policy"
     block_schedule: str | None = None
     few_shot: int | None = None
+    block_sampling_mode: str | None = None
 
 
 def resolve_block_length(cfg: EvalConfig) -> int:
@@ -165,6 +166,12 @@ def run_eval(
             # picks both per block), so tag it to keep these runs separate from a
             # fixed-block eval of the same checkpoint.
             output_dir = Path(f"{output_dir}_blockpolicy")
+        elif cfg.remasking == "block_unmask_policy":
+            # Same reason; the block-size sampling mode is part of the name so a
+            # greedy and a stochastic eval of one checkpoint never share a dir.
+            output_dir = Path(f"{output_dir}_blockunmask")
+            if cfg.block_sampling_mode:
+                output_dir = Path(f"{output_dir}_block_{cfg.block_sampling_mode}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -207,6 +214,8 @@ def run_eval(
             )
         if cfg.remasking == "block_schedule":
             cmd.extend(["--block_schedule", cfg.block_schedule])
+        if cfg.block_sampling_mode:
+            cmd.extend(["--block_sampling_mode", cfg.block_sampling_mode])
         if cfg.few_shot is not None:
             cmd.extend(["--few_shot", str(cfg.few_shot)])
 
@@ -303,7 +312,7 @@ def main():
     parser.add_argument(
         "--remasking",
         default="policy",
-        choices=["policy", "block_policy", "block_schedule"],
+        choices=["policy", "block_policy", "block_schedule", "block_unmask_policy"],
         help="Learned strategy to evaluate. Ignored for baseline-* run paths, "
         "whose method is parsed out of the checkpoint name.",
     )
@@ -311,6 +320,12 @@ def main():
         "--block_schedule",
         default=None,
         help="Fixed 'b:thres,...' action list for --remasking block_schedule.",
+    )
+    parser.add_argument(
+        "--block_sampling_mode",
+        default=None,
+        help="For --remasking block_unmask_policy: 'categorical' or "
+        "'categorical-argmax' for the block-size head (default: config value).",
     )
     parser.add_argument(
         "--few_shot",
@@ -356,6 +371,7 @@ def main():
             remasking=args.remasking,
             block_schedule=args.block_schedule,
             few_shot=args.few_shot,
+            block_sampling_mode=args.block_sampling_mode,
         )
         try:
             run_names.append(run_pipeline(cfg))

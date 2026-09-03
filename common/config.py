@@ -73,6 +73,12 @@ class Config(GRPOConfig):
     )
     remasking: Optional["str"] = field(
         default="low_confidence",
+        metadata={
+            "help": "Decoding strategy. Learned: 'policy' (per-position unmasking, fixed "
+            "block_length), 'block_policy' (block size + Fast-dLLM threshold), "
+            "'block_unmask_policy' (block size + per-position unmasking). Heuristic: "
+            "'fastdllm', 'low_confidence', 'random'; eval-only control: 'block_schedule'."
+        },
     )
     dataset: Optional[str] = field(
         default="gsm8k",
@@ -89,15 +95,17 @@ class Config(GRPOConfig):
         default="dit_confidence",
         metadata={
             "help": "Type of policy to use. Options: ['dit_hidden', 'dit_hidden_proj', "
-            "'dit_confidence', 'dit_block_size', 'dit_block_size_hidden_proj']."
+            "'dit_confidence', 'dit_block_size', 'dit_block_size_hidden_proj', "
+            "'dit_block_unmask']."
         },
     )
 
     block_size_candidates: Optional[list[int]] = field(
         default_factory=lambda: [8, 16, 32, 64, 128],
         metadata={
-            "help": "Ascending candidate block sizes for the joint (block size, threshold) "
-            "policy. Only used by the 'dit_block_size*' policy types."
+            "help": "Ascending candidate block sizes for the block-size policies. Used by "
+            "the 'dit_block_size*' policy types (remasking='block_policy') and by "
+            "'dit_block_unmask' (remasking='block_unmask_policy')."
         },
     )
 
@@ -180,7 +188,19 @@ class Config(GRPOConfig):
     sampling_mode: str = field(
         default="bernoulli",
         metadata={
-            "help": "Type of sampling strategy to use. Options: ['bernoulli', 'bernoulli-argmax', 'dpls', 'categorical']."
+            "help": "Type of sampling strategy to use. Options: ['bernoulli', 'bernoulli-argmax', 'dpls', 'categorical']. "
+            "For remasking='block_unmask_policy' this is the per-position head's mode "
+            "('bernoulli' to train, 'bernoulli-argmax' to eval); the block-size head uses "
+            "block_sampling_mode."
+        },
+    )
+
+    block_sampling_mode: str = field(
+        default="categorical",
+        metadata={
+            "help": "How remasking='block_unmask_policy' draws the block size: "
+            "'categorical' (sample; training) or 'categorical-argmax' (greedy; eval). "
+            "remasking='block_policy' uses sampling_mode for this instead."
         },
     )
 

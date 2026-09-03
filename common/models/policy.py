@@ -392,6 +392,61 @@ class HiddenProjInputMixin:
         return self.proj(self.in_norm(h))
 
 
+def boundary_block_logits(
+    u: torch.Tensor,
+    block_start: torch.Tensor,
+    candidates: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Block-size logits from per-position boundary scores.
+
+    u[i] is read as "the score of ending the current block just after position i", so
+    candidate b scores u[block_start + b - 1], plus a learnable per-candidate prior.
+    Candidates that do not fit in what is left of the sequence are masked to -inf.
+    Shared by DiTBlockSizePolicy and DiTBlockUnmaskPolicy.
+
+    :param u: (*B,L) boundary scores
+    :param block_start: (*B,1) integer index of the current block's first position
+    :param candidates: (K,) ascending candidate block sizes
+    :param bias: (K,) per-candidate prior logits
+    :return: (*B,K) block-size logits with -inf on infeasible candidates
+    """
+    L = u.shape[-1]
+    start = block_start.long()  # (*B, 1)
+    end = start + candidates  # (*B, K)
+    feasible = end <= L
+    # Defensive: the multiple-of-8 tiling invariant means the smallest candidate
+    # always fits, but an all-infeasible row would make softmax produce NaN.
+    no_feasible = ~feasible.any(dim=-1, keepdim=True)
+    smallest = torch.zeros_like(feasible)
+    smallest[..., 0] = True
+    feasible = feasible | (no_feasible & smallest)
+
+    logits = u.gather(-1, (end - 1).clamp(max=L - 1)) + bias
+    return logits.masked_fill(~feasible, float("-inf"))
+
+
+def _validate_block_size_candidates(
+    block_size_candidates: tuple[int, ...],
+    block_size_prior_logits: tuple[float, ...] | None,
+) -> torch.Tensor:
+    """Check the candidate set and build the initial prior bias (zeros = uniform)."""
+    if len(block_size_candidates) == 0:
+        raise ValueError("block_size_candidates must be non-empty")
+    if sorted(block_size_candidates) != list(block_size_candidates):
+        raise ValueError(
+            f"block_size_candidates must be ascending, got {block_size_candidates}"
+        )
+    if block_size_prior_logits is None:
+        return torch.zeros(len(block_size_candidates))
+    if len(block_size_prior_logits) != len(block_size_candidates):
+        raise ValueError(
+            f"block_size_prior_logits has {len(block_size_prior_logits)} entries "
+            f"but there are {len(block_size_candidates)} candidates"
+        )
+    return torch.tensor(block_size_prior_logits, dtype=torch.float32)
+
+
 class DiTBlockSizePolicy(DiTConfidencePolicy):
     """Joint (block size, Fast-dLLM threshold) policy; see formulation.md.
 
@@ -418,12 +473,13 @@ class DiTBlockSizePolicy(DiTConfidencePolicy):
     ):
         super().__init__(**kwargs)
 
-        if len(block_size_candidates) == 0 or len(thresholds) == 0:
-            raise ValueError("block_size_candidates and thresholds must be non-empty")
-        if sorted(block_size_candidates) != list(block_size_candidates):
-            raise ValueError(
-                f"block_size_candidates must be ascending, got {block_size_candidates}"
-            )
+        if len(thresholds) == 0:
+            raise ValueError("thresholds must be non-empty")
+        # Per-candidate prior over block sizes. Zero => uniform at init, since
+        # smart_init makes every u[i] equal and hence every gathered score equal.
+        init_bias = _validate_block_size_candidates(
+            block_size_candidates, block_size_prior_logits
+        )
 
         self.register_buffer(
             "block_size_candidates",
@@ -435,18 +491,6 @@ class DiTBlockSizePolicy(DiTConfidencePolicy):
             torch.tensor(thresholds, dtype=torch.float32),
             persistent=False,
         )
-
-        # Per-candidate prior over block sizes. Zero => uniform at init, since
-        # smart_init makes every u[i] equal and hence every gathered score equal.
-        if block_size_prior_logits is None:
-            init_bias = torch.zeros(len(block_size_candidates))
-        else:
-            if len(block_size_prior_logits) != len(block_size_candidates):
-                raise ValueError(
-                    f"block_size_prior_logits has {len(block_size_prior_logits)} entries "
-                    f"but there are {len(block_size_candidates)} candidates"
-                )
-            init_bias = torch.tensor(block_size_prior_logits, dtype=torch.float32)
         self.block_size_bias = nn.Parameter(init_bias)
 
         # Zero-init so the threshold distribution also starts uniform. Note this must
@@ -481,17 +525,9 @@ class DiTBlockSizePolicy(DiTConfidencePolicy):
         start = block_start.long()  # (*B, 1)
 
         ### Block-size head: gather the boundary score of each candidate
-        end = start + self.block_size_candidates  # (*B, K)
-        feasible = end <= L
-        # Defensive: the multiple-of-8 tiling invariant means the smallest candidate
-        # always fits, but an all-infeasible row would make softmax produce NaN.
-        no_feasible = ~feasible.any(dim=-1, keepdim=True)
-        smallest = torch.zeros_like(feasible)
-        smallest[..., 0] = True
-        feasible = feasible | (no_feasible & smallest)
-
-        block_logits = u.gather(-1, (end - 1).clamp(max=L - 1)) + self.block_size_bias
-        block_logits = block_logits.masked_fill(~feasible, float("-inf"))
+        block_logits = boundary_block_logits(
+            u, start, self.block_size_candidates, self.block_size_bias
+        )
 
         ### Threshold head: masked mean-pool over the lookahead window
         max_block = int(self.block_size_candidates[-1].item())
@@ -517,3 +553,77 @@ class DiTBlockSizeHiddenProjPolicy(HiddenProjInputMixin, DiTBlockSizePolicy):
     forward(m, h, timestep, block_start) -> (block-size logits, threshold logits).
     Both heads read the shared trunk, so swapping embed_input() is the whole change.
     """
+
+
+class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
+    """Joint (block size, per-position unmasking) policy; formulation.md 10, item 3.
+
+    The paper's per-position policy with a learned block schedule on top. One
+    DiTConfidencePolicy trunk, two heads:
+
+    - unmask: the parent's output_proj, unchanged. Per-position Bernoulli logits,
+      sampled only inside the current block. policy_smart_init still sets its bias,
+      so the initial decoding rate means what it means in the paper.
+    - block size: a separate, zero-initialised boundary_proj scores "end the block
+      after position i"; candidate b reads that score at block_start + b - 1 plus a
+      learnable prior (boundary_block_logits). Zero init makes the block marginal
+      exactly uniform over feasible candidates at step 0, unlike DiTBlockSizePolicy,
+      whose reuse of output_proj only gets near-uniform.
+
+    There is no threshold head: within a block the unmask head is the decoder, so
+    Fast-dLLM's tau has nothing left to do. The two heads are conditionally
+    independent given the state; the trainer sums their log-probs per timestep, and
+    the block term is only present on the step that enters a new block.
+    """
+
+    def __init__(
+        self,
+        block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
+        block_size_prior_logits: tuple[float, ...] | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        init_bias = _validate_block_size_candidates(
+            block_size_candidates, block_size_prior_logits
+        )
+        self.register_buffer(
+            "block_size_candidates",
+            torch.tensor(block_size_candidates, dtype=torch.long),
+            persistent=False,
+        )
+        self.block_size_bias = nn.Parameter(init_bias)
+
+        # Zero-init weight AND bias: every boundary score is 0, so the block logits
+        # are exactly the prior. Must happen here, not in apply_smart_init, which the
+        # parent __init__ runs before this head exists.
+        self.boundary_proj = nn.Linear(self.hidden_dim, 1)
+        with torch.no_grad():
+            self.boundary_proj.weight.data.zero_()
+            self.boundary_proj.bias.data.zero_()
+
+    def forward(
+        self,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        timestep: torch.Tensor,
+        block_start: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """:param m: (*B,L) mask with 1=masked, 0=unmasked
+        :param c: (*B,L,confidences_top_p) confidence values in [0,1]
+        :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
+        :param block_start: (*B,1) integer index of the current block's first position
+        :return: ((*B,L) unmasking logits, (*B,K_block) block-size logits)
+        """
+        *B, L, _ = c.shape
+        assert block_start.shape == (*B, 1), (
+            f"Unexpected {block_start.shape=}; batch dim(s) {B=}"
+        )
+
+        h = self.trunk(m, c, timestep)  # (*B, L, H)
+        unmask_logits = self.output_proj(h).squeeze(-1)  # (*B, L)
+        u = self.boundary_proj(h).squeeze(-1)  # (*B, L)
+        block_logits = boundary_block_logits(
+            u, block_start, self.block_size_candidates, self.block_size_bias
+        )
+        return unmask_logits, block_logits

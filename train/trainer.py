@@ -53,6 +53,16 @@ except ImportError:
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 
+def _uses_block_unmask(args) -> bool:
+    """remasking='block_unmask_policy': both heads packed side by side per timestep.
+
+    A free function over ``args`` rather than a Trainer attribute, so the stubs that
+    borrow Trainer's methods without subclassing it (tests/test_ddp_chunked_backward.py)
+    resolve it too.
+    """
+    return getattr(args, "remasking", None) == "block_unmask_policy"
+
+
 class Trainer(GRPOTrainer):
     def __init__(
         self,
@@ -97,7 +107,7 @@ class Trainer(GRPOTrainer):
         self._buffered_inputs = None
         self._step = 0
 
-        if self.args.remasking == "policy":
+        if self.args.remasking in ("policy", "block_policy", "block_unmask_policy"):
             assert self.beta == 0.0, "Beta must be 0.0 for policy-based remasking"
 
         # Gradient accumulation not supported with current buffering logic
@@ -508,10 +518,20 @@ class Trainer(GRPOTrainer):
 
         # Log entropy if collected
         if entropy_accumulator:
-            mean_entropy = torch.stack(entropy_accumulator).mean()
-            self._metrics["train"]["entropy"].append(
-                self.accelerator.gather_for_metrics(mean_entropy).mean().item()
-            )
+            mean_entropy = torch.stack(entropy_accumulator).mean(dim=0)
+            if mean_entropy.ndim == 0:
+                self._metrics["train"]["entropy"].append(
+                    self.accelerator.gather_for_metrics(mean_entropy).mean().item()
+                )
+            else:
+                # block_unmask_policy: [per-position Bernoulli entropy, block-size
+                # categorical entropy]. Logged separately -- the block one is the
+                # collapse signal (formulation.md 9), the other the decoding-rate one.
+                gathered = self.accelerator.gather_for_metrics(
+                    mean_entropy.unsqueeze(0)
+                ).mean(dim=0)
+                self._metrics["train"]["entropy"].append(gathered[0].item())
+                self._metrics["train"]["block_entropy"].append(gathered[1].item())
 
         return loss
 
@@ -584,13 +604,19 @@ class Trainer(GRPOTrainer):
         with torch.amp.autocast("cuda", enabled=self.args.fp16):
             logits = model(*policy_inputs)  # (B, T, BL)
 
-        if sampling_mode == "categorical":
-            # The block-size policy returns the two heads separately; concatenate them
+        if sampling_mode == "categorical" or _uses_block_unmask(self.args):
+            # The two-headed policies return their heads separately; concatenate them
             # into the same layout the rollout recorded so one code path handles both.
-            logits = torch.cat(logits, dim=-1)  # (B, T, K_block + K_thres)
+            logits = torch.cat(logits, dim=-1)  # (B, T, K_block + K_thres) or (B, T, L + K)
 
         # Calculate corresponding log-likelihoods under the model
-        if sampling_mode == "categorical":
+        if _uses_block_unmask(self.args):
+            lls = self._block_unmask_joint_loglik(
+                samples=samples,
+                logits=logits,
+                sampling_masks=sampling_masks,
+            )
+        elif sampling_mode == "categorical":
             lls = self._categorical_joint_loglik(
                 samples=samples,
                 logits=logits,
@@ -617,7 +643,24 @@ class Trainer(GRPOTrainer):
         # Compute entropy if requested
         entropy = None
         if return_entropy:
-            if sampling_mode == "categorical":
+            if _uses_block_unmask(self.args):
+                n = sampling_masks.shape[-1] - 1
+                pos_logits, block_logits = logits[..., :n], logits[..., n:]
+                pos_mask = sampling_masks[..., :n].float()
+                p = torch.sigmoid(pos_logits).clamp(1e-8, 1 - 1e-8)
+                pos_entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+                pos_entropy = (pos_entropy * pos_mask).sum() / pos_mask.sum().clamp(
+                    min=1
+                )
+                dec_mask = sampling_masks[..., n].float()
+                block_entropy = categorical_entropy(
+                    block_logits, feasible_mask=torch.isfinite(block_logits)
+                )
+                block_entropy = (block_entropy * dec_mask).sum() / dec_mask.sum().clamp(
+                    min=1
+                )
+                entropy = torch.stack([pos_entropy, block_entropy])
+            elif sampling_mode == "categorical":
                 # Joint entropy of two independent categoricals is the sum. Averaged
                 # over real decisions only -- this is the primary collapse signal
                 # (formulation.md 9), so padded slots must not dilute it.
@@ -694,13 +737,54 @@ class Trainer(GRPOTrainer):
             dtype=self.args.loglikelihood_dtype,
         )
 
+    def _block_unmask_joint_loglik(
+        self,
+        samples: torch.Tensor,
+        logits: torch.Tensor,
+        sampling_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Joint log-prob of one timestep of remasking='block_unmask_policy'.
+
+        The per-position Bernoulli term is always present on active steps; the
+        block-size categorical term only on the step that entered a new block (the
+        last column of sampling_masks). Both heads are conditionally independent
+        given the state, so the joint log-prob is the sum. The rollout's old
+        log-probs and this recomputation must use exactly this decomposition, or the
+        GRPO ratio is not 1 on the first inner iteration.
+
+        :param samples: (..., L+1) long, [bernoulli draws | block-size index]
+        :param logits: (..., L+K) [unmask logits | block-size logits]
+        :param sampling_masks: (..., L+1) bool, [in-block masked positions | decided]
+        :return: (...,) joint log-likelihood
+        """
+        n = sampling_masks.shape[-1] - 1
+        pos_ll = bernoulli_batch_loglik(
+            samples[..., :n],
+            logits[..., :n],
+            mask_index=sampling_masks[..., :n],
+            dtype=self.args.loglikelihood_dtype,
+        )
+        block_ll = categorical_batch_loglik(
+            samples[..., n],
+            logits[..., n:],
+            action_mask=sampling_masks[..., n],
+            dtype=self.args.loglikelihood_dtype,
+        )
+        return pos_ll + block_ll
+
     def _compute_mask_loglikelihood(
         self,
         samples: torch.Tensor,
         sampling_inputs: torch.Tensor,
         sampling_masks: torch.Tensor,
     ) -> torch.Tensor:
-        if self.args.sampling_mode == "categorical":
+        if _uses_block_unmask(self.args):
+            return self._block_unmask_joint_loglik(
+                samples=samples,
+                logits=sampling_inputs,
+                sampling_masks=sampling_masks,
+            )
+        elif self.args.sampling_mode == "categorical":
             return self._categorical_joint_loglik(
                 samples=samples,
                 logits=sampling_inputs,
@@ -799,11 +883,12 @@ class Trainer(GRPOTrainer):
                     dtype=unwrapped_model.dtype,
                     device=unwrapped_model.device,
                 ).unsqueeze(-1)
-            if self.args.remasking in ("policy", "block_policy"):
+            if self.args.remasking in ("policy", "block_policy", "block_unmask_policy"):
                 policy_outputs_all = []
                 still_masked_all = []
                 block_sizes_all = []
                 thresholds_all = []
+                block_decisions_all = []
                 is_block_policy = self.args.remasking == "block_policy"
                 for i in range(0, prompt_ids.size(0), generation_batch_size):
                     end_idx = min(i + generation_batch_size, prompt_ids.size(0))
@@ -822,6 +907,15 @@ class Trainer(GRPOTrainer):
                             "threshold_candidates": tuple(
                                 self.args.threshold_candidates
                             ),
+                        }
+                    elif _uses_block_unmask(self.args):
+                        # Block size from the policy; within the block the unmask
+                        # head decides, so there is no threshold at all.
+                        extra_kwargs = {
+                            "block_size_candidates": tuple(
+                                self.args.block_size_candidates
+                            ),
+                            "block_sampling_mode": self.args.block_sampling_mode,
                         }
 
                     result = generate_unified(
@@ -842,9 +936,10 @@ class Trainer(GRPOTrainer):
                         replay_policy_inputs=self.replay_policy_inputs,
                         **extra_kwargs,
                     )
-                    if is_block_policy:
+                    if is_block_policy or _uses_block_unmask(self.args):
                         block_sizes_all.append(result.block_sizes_chosen)
                         thresholds_all.append(result.thresholds_chosen)
+                        block_decisions_all.append(result.block_decisions)
 
                     # Extract values from NamedTuple
                     batch_prompt_completion_ids = result.sequences
@@ -1210,18 +1305,23 @@ class Trainer(GRPOTrainer):
                         self.args, self.state, self.control, best=True
                     )
 
-        # Log metrics to detect the collapse to 0 policy
-        if self.args.remasking == "block_policy":
-            # The per-position unmask-probability diagnostics below are meaningless for
-            # a categorical action; log the action distribution instead. Per
-            # formulation.md 9 the histogram and the entropy are the collapse signal
-            # that decides whether to abandon the run early.
+        # Log metrics to detect the collapse to 0 policy. The block-size histogram and
+        # the per-position unmask-probability diagnostics are independent blocks:
+        # block_policy gets only the first, policy only the second, and
+        # block_unmask_policy both.
+        if self.args.remasking in ("block_policy", "block_unmask_policy"):
+            # Per formulation.md 9 the action histogram and the entropy are the
+            # collapse signal that decides whether to abandon the run early.
             device = num_steps.device
             cand_b = torch.tensor(
                 self.args.block_size_candidates, device=device, dtype=torch.long
             )
+            # block_unmask_policy has no threshold axis at all.
+            has_thres = thresholds_all[0] is not None
             cand_t = torch.tensor(
-                self.args.threshold_candidates, device=device, dtype=torch.float32
+                self.args.threshold_candidates if has_thres else [],
+                device=device,
+                dtype=torch.float32,
             )
 
             # Accumulate over generation chunks rather than concatenating them:
@@ -1231,28 +1331,31 @@ class Trainer(GRPOTrainer):
             counts_t = torch.zeros(len(cand_t), device=device)
             totals = torch.zeros(3, device=device)  # [n_decisions, sum_b, sum_t]
             per_row_blocks = []
-            for bs_chunk, th_chunk, po in zip(
-                block_sizes_all, thresholds_all, policy_outputs_all
+            for bs_chunk, th_chunk, act in zip(
+                block_sizes_all, thresholds_all, block_decisions_all
             ):
-                act = po["sampling_masks"][..., 0]  # (B, T)
+                # act: (B, T) True on the slots that carry a real decision
                 counts_b += (
                     ((bs_chunk.unsqueeze(-1) == cand_b) & act.unsqueeze(-1))
                     .sum(dim=(0, 1))
                     .float()
                 )
-                counts_t += (
-                    (
-                        ((th_chunk.unsqueeze(-1) - cand_t).abs() < 1e-6)
-                        & act.unsqueeze(-1)
+                sum_t = torch.zeros((), device=device)
+                if has_thres:
+                    counts_t += (
+                        (
+                            ((th_chunk.unsqueeze(-1) - cand_t).abs() < 1e-6)
+                            & act.unsqueeze(-1)
+                        )
+                        .sum(dim=(0, 1))
+                        .float()
                     )
-                    .sum(dim=(0, 1))
-                    .float()
-                )
+                    sum_t = (th_chunk * act).sum().float()
                 totals += torch.stack(
                     [
                         act.sum().float(),
                         (bs_chunk * act).sum().float(),
-                        (th_chunk * act).sum().float(),
+                        sum_t,
                     ]
                 )
                 per_row_blocks.append(act.sum(dim=-1).float())
@@ -1272,7 +1375,6 @@ class Trainer(GRPOTrainer):
 
             n_dec = totals[0].clamp(min=1.0)
             self._metrics[mode]["block_size/mean"].append((totals[1] / n_dec).item())
-            self._metrics[mode]["threshold/mean"].append((totals[2] / n_dec).item())
             self._metrics[mode]["num_blocks_mean"].append(
                 per_row_blocks.mean().item()
             )
@@ -1280,11 +1382,15 @@ class Trainer(GRPOTrainer):
                 self._metrics[mode][f"block_size/frac_{b}"].append(
                     (counts_b[i] / n_dec).item()
                 )
-            for i, t in enumerate(self.args.threshold_candidates):
-                self._metrics[mode][f"threshold/frac_{t}"].append(
-                    (counts_t[i] / n_dec).item()
+            if has_thres:
+                self._metrics[mode]["threshold/mean"].append(
+                    (totals[2] / n_dec).item()
                 )
-        else:
+                for i, t in enumerate(self.args.threshold_candidates):
+                    self._metrics[mode][f"threshold/frac_{t}"].append(
+                        (counts_t[i] / n_dec).item()
+                    )
+        if self.args.remasking in ("policy", "block_unmask_policy"):
             avg_us_all = []
             max_us_all = []
             non_zero_active_us_all = []
@@ -1300,6 +1406,12 @@ class Trainer(GRPOTrainer):
                     "samples"
                 ]  # One-hot bernoulli outcomes for Bernoulli, ordered indices for PL
                 ms = policy_outputs_all[i]["sampling_masks"]
+                if _uses_block_unmask(self.args):
+                    # Drop the block-size columns packed after the L positions.
+                    n = ms.shape[-1] - 1
+                    sampling_inputs = sampling_inputs[..., :n]
+                    samples = samples[..., :n].bool()
+                    ms = ms[..., :n]
 
                 # Convert to probabilities for consistent logging across sampling modes
                 if self.args.sampling_mode == "dpls":

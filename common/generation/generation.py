@@ -48,6 +48,10 @@ class GenerationResult(NamedTuple):
     # Padded to T with sampling_masks marking the real decisions.
     block_sizes_chosen: torch.Tensor | None = None  # (B, T) chosen block length
     thresholds_chosen: torch.Tensor | None = None  # (B, T) chosen Fast-dLLM threshold
+    # (B, T) True on the slots that carry a real block-size decision. For
+    # block_policy this is sampling_masks[..., 0]; for block_unmask_policy the time
+    # axis is per forward pass and only block-entry steps are True.
+    block_decisions: torch.Tensor | None = None
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -87,6 +91,7 @@ def generate_unified(
     block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
     threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
     block_schedule: tuple[tuple[int, float], ...] | None = None,
+    block_sampling_mode: str = "categorical",
 ) -> GenerationResult:
     if record_probe_data and adaptive_block:
         # Only the fixed-block loop has the recording hook; the adaptive and
@@ -117,6 +122,29 @@ def generate_unified(
         elif not block_schedule:
             raise ValueError(
                 "block_schedule must be provided for remasking='block_schedule'"
+            )
+        if gen_length % min(block_size_candidates) != 0:
+            raise ValueError(
+                f"gen_length ({gen_length}) must be divisible by the smallest block "
+                f"candidate ({min(block_size_candidates)}) so blocks tile exactly"
+            )
+    elif remasking == "block_unmask_policy":
+        if policy is None:
+            raise ValueError("policy must be provided for remasking='block_unmask_policy'")
+        if sampling_mode not in ("bernoulli", "bernoulli-argmax"):
+            raise ValueError(
+                "remasking='block_unmask_policy' supports sampling_mode 'bernoulli' or "
+                f"'bernoulli-argmax' for the per-position head, got {sampling_mode!r}"
+            )
+        if block_sampling_mode not in ("categorical", "categorical-argmax"):
+            raise ValueError(
+                "remasking='block_unmask_policy' supports block_sampling_mode "
+                f"'categorical' or 'categorical-argmax', got {block_sampling_mode!r}"
+            )
+        if not full_context:
+            raise ValueError(
+                "remasking='block_unmask_policy' requires full_context=True: blocks "
+                "are per row, so the policy must see the whole generation region"
             )
         if gen_length % min(block_size_candidates) != 0:
             raise ValueError(
@@ -203,6 +231,12 @@ def generate_unified(
             policy.module.policy_type
             if hasattr(policy, "module")
             else policy.policy_type
+        )
+
+    if remasking == "block_unmask_policy" and policy_type != "dit_block_unmask":
+        raise ValueError(
+            "remasking='block_unmask_policy' requires policy_type='dit_block_unmask', "
+            f"got {policy_type!r}"
         )
 
     # The hidden-state policies read model_output.hidden_states[-1]; the confidence
@@ -555,7 +589,25 @@ def generate_unified(
             ),
             "block_sizes_chosen": rec_block_size[:, :T_max],
             "thresholds_chosen": rec_thres[:, :T_max],
+            "block_decisions": rec_mask[:, :T_max, 0],
         }
+    elif remasking == "block_unmask_policy":
+        block_policy_data = _block_unmask_policy_loop(
+            x,
+            prompt_L,
+            L,
+            mask_id,
+            max_steps,
+            steps_taken,
+            policy,
+            _forward_logits,
+            _record_order if record_unmask_order else None,
+            block_size_candidates,
+            sampling_mode,
+            block_sampling_mode,
+            confidences_top_p,
+            temperature_policy,
+        )
     elif not adaptive_block:
         for num_block in range(num_blocks):
             start_idx = num_block * block_length
@@ -1042,6 +1094,191 @@ def _confidence_threshold_unmask_rowwise(
         unmask[rows, force_idx[rows]] = True
 
     return unmask
+
+
+def _bernoulli_unmask_rowwise(
+    unmask_logits: torch.Tensor,
+    sampling_mask: torch.Tensor,
+    sampling_mode: str,
+) -> torch.Tensor:
+    """Per-position Bernoulli unmasking with per-row block masks.
+
+    Sibling of the bernoulli branches in _policy_unmask_decisions, for the loop where
+    every row sits in its own block. The 'bernoulli-argmax' fallback is applied **per
+    row**: the shared path tests `b.sum(dim=-1) == 0` per row already, but scatters
+    into a batch-shared block slice, which does not exist here. A row with masked
+    positions in its block and no draw would otherwise burn an NFE without progress.
+
+    :param unmask_logits: (B, L) per-position logits
+    :param sampling_mask: (B, L) still-masked positions inside each row's own block
+    :param sampling_mode: 'bernoulli' (training; no fallback, matching the loglik) or
+        'bernoulli-argmax' (eval; force the argmax when nothing was drawn)
+    :return: (B, L) boolean mask of positions to unmask
+    """
+    b = bernoulli_sample(utilities=unmask_logits, mask_index=sampling_mask)
+    if sampling_mode == "bernoulli-argmax":
+        stalled = sampling_mask.any(dim=-1) & ~b.any(dim=-1)  # (B,)
+        if stalled.any():
+            masked_logits = unmask_logits.masked_fill(~sampling_mask, -torch.inf)
+            force_idx = masked_logits.argmax(dim=-1)  # (B,)
+            rows = stalled.nonzero(as_tuple=True)[0]
+            b[rows, force_idx[rows]] = True
+    return b
+
+
+def _block_unmask_policy_loop(
+    x: torch.Tensor,
+    prompt_L: int,
+    L: int,
+    mask_id: int,
+    max_steps: int,
+    steps_taken: torch.Tensor,
+    policy,
+    forward_logits,
+    record_order,
+    block_size_candidates: tuple[int, ...],
+    sampling_mode: str,
+    block_sampling_mode: str,
+    confidences_top_p: int,
+    temperature_policy: float,
+) -> dict:
+    """Decode with a learned block size AND a learned per-position unmasking policy.
+
+    Same per-row [block_start, block_end) machinery as the block_policy loop in
+    generate_unified, with two differences:
+
+    - the policy runs on EVERY forward (the unmask head is needed every step) and
+      returns both heads; the block head is only sampled on the step a row enters a
+      new block, so the block decision still costs no extra NFE;
+    - Fast-dLLM thresholding is replaced by the unmask head, so there is no threshold.
+
+    Recording is per forward pass (like the `policy` path), not per decision (like
+    block_policy): the per-position stream is inherently step-indexed, and the trainer
+    needs one shared time axis. Both heads are packed side by side along the last dim
+    so compute_loss's generic time slicing works unchanged; the trainer splits them at
+    L. On steps where a row makes no block decision its block slot is masked out.
+
+    Mutates x and steps_taken in place (they are generate_unified's own tensors).
+
+    :return: dict of GenerationResult fields:
+        sampling_inputs (B,T,L+K) = [unmask logits | block logits]
+        samples (B,T,L+1) long = [bernoulli draws | block-size index]
+        sampling_masks (B,T,L+1) bool = [in-block masked positions | made a decision]
+        policy_inputs = (m (B,T,L), c (B,T,L,P), t (B,T,1), block_start (B,T,1))
+        block_sizes_chosen (B,T) long (0 off-decision), block_decisions (B,T) bool
+    """
+    B = x.shape[0]
+    device = x.device
+    cand_b = torch.tensor(block_size_candidates, dtype=torch.long, device=device)
+    K = len(cand_b)
+
+    block_start = torch.zeros(B, dtype=torch.long, device=device)
+    block_end = torch.zeros(B, dtype=torch.long, device=device)
+    positions = torch.arange(L, device=device)
+    history = []
+
+    for _ in range(L):
+        generation_part = x[:, prompt_L:]
+        mask_index = (generation_part == mask_id) & (steps_taken < max_steps).unsqueeze(
+            -1
+        )
+        active = mask_index.any(dim=-1)
+        if not active.any():
+            break
+
+        _, probs, x0 = forward_logits()
+        c = probs.topk(confidences_top_p, dim=-1).values  # (B, L, P)
+        per_batch_timestep = steps_taken.unsqueeze(-1) * (1 / L)  # (B, 1)
+        # Recorded before the advance below: it is the value this forward saw, and
+        # the loss recomputes the block logits from it.
+        start_in = block_start.unsqueeze(-1).clone()  # (B, 1)
+
+        unmask_logits, block_logits = policy(mask_index, c, per_batch_timestep, start_in)
+        if temperature_policy != 1.0:
+            unmask_logits = unmask_logits / temperature_policy
+            block_logits = block_logits / temperature_policy
+
+        # A row needs a new block exactly when it has no live block.
+        needs = active & (block_start == block_end)
+        b_idx = torch.zeros(B, dtype=torch.long, device=device)
+        if needs.any():
+            feasible = torch.isfinite(block_logits)
+            if block_sampling_mode == "categorical-argmax":
+                drawn = block_logits.masked_fill(~feasible, float("-inf")).argmax(dim=-1)
+            else:
+                drawn = categorical_sample(block_logits, feasible)  # (B,)
+            b_idx = torch.where(needs, drawn, b_idx)
+            block_end = torch.where(needs, block_start + cand_b[b_idx], block_end)
+
+        block_index = (positions >= block_start.unsqueeze(-1)) & (
+            positions < block_end.unsqueeze(-1)
+        )  # (B, L)
+        sampling_mask = mask_index & block_index
+        unmask = _bernoulli_unmask_rowwise(unmask_logits, sampling_mask, sampling_mode)
+
+        history.append(
+            {
+                "sampling_inputs": torch.cat(
+                    [unmask_logits.detach().float(), block_logits.detach().float()],
+                    dim=-1,
+                ),
+                "samples": torch.cat([unmask.long(), b_idx.unsqueeze(-1)], dim=-1),
+                "sampling_masks": torch.cat(
+                    [sampling_mask, needs.unsqueeze(-1)], dim=-1
+                ),
+                "policy_inputs": (
+                    mask_index,
+                    c.detach(),
+                    per_batch_timestep,
+                    start_in,
+                ),
+                "block_sizes_chosen": torch.where(
+                    needs, cand_b[b_idx], torch.zeros_like(b_idx)
+                ),
+            }
+        )
+
+        x[:, prompt_L:] = torch.where(unmask, x0, generation_part)
+        if record_order is not None:
+            record_order(unmask)
+        steps_taken += sampling_mask.any(dim=-1).int()
+
+        # Rows whose current block is now full advance; start == end then triggers
+        # a fresh decision on the next iteration.
+        block_done = ~((x[:, prompt_L:] == mask_id) & block_index).any(dim=-1)
+        block_start = torch.where(active & block_done, block_end, block_start)
+
+    if not history:
+        # Nothing to decode (every row was already complete). Return one padded slot
+        # so the trainer's shape assumptions hold.
+        zeros_l = torch.zeros((B, 1, L), device=device)
+        return {
+            "sampling_inputs": torch.cat(
+                [zeros_l, torch.zeros((B, 1, K), device=device)], dim=-1
+            ),
+            "samples": torch.zeros((B, 1, L + 1), dtype=torch.long, device=device),
+            "sampling_masks": torch.zeros(
+                (B, 1, L + 1), dtype=torch.bool, device=device
+            ),
+            "policy_inputs": (
+                torch.zeros((B, 1, L), dtype=torch.bool, device=device),
+                torch.zeros((B, 1, L, confidences_top_p), device=device),
+                torch.zeros((B, 1, 1), device=device),
+                torch.zeros((B, 1, 1), dtype=torch.long, device=device),
+            ),
+            "block_sizes_chosen": torch.zeros((B, 1), dtype=torch.long, device=device),
+            "block_decisions": torch.zeros((B, 1), dtype=torch.bool, device=device),
+        }
+
+    stacked = {
+        k: torch.stack([h[k] for h in history], dim=1)
+        for k in ("sampling_inputs", "samples", "sampling_masks", "block_sizes_chosen")
+    }
+    stacked["policy_inputs"] = tuple(
+        torch.stack(col, dim=1) for col in zip(*[h["policy_inputs"] for h in history])
+    )
+    stacked["block_decisions"] = stacked["sampling_masks"][..., L]
+    return stacked
 
 
 def _record_policy_data(

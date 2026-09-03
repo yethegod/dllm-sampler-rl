@@ -26,6 +26,7 @@ from common.models.policy import DiTHiddenStatePolicy
 from common.models.policy import DiTHiddenProjPolicy
 from common.models.policy import DiTBlockSizePolicy
 from common.models.policy import DiTBlockSizeHiddenProjPolicy
+from common.models.policy import DiTBlockUnmaskPolicy
 from common.models.policy import DiTConfidencePolicy
 from common.models.policy import PolicyHFWrapper
 from common.s3 import S3UploadCallback
@@ -90,10 +91,33 @@ def main(grpo_config, model_config):
     # During training, remasking must be a learned strategy: "policy" learns which
     # positions to unmask at a fixed schedule, "block_policy" learns the schedule
     # itself (block size + threshold) and decodes within a block with Fast-dLLM.
-    assert grpo_config.remasking in ("policy", "block_policy"), (
-        f"Training only supports remasking in ('policy', 'block_policy'), "
-        f"got '{grpo_config.remasking}'"
+    assert grpo_config.remasking in ("policy", "block_policy", "block_unmask_policy"), (
+        "Training only supports remasking in ('policy', 'block_policy', "
+        f"'block_unmask_policy'), got '{grpo_config.remasking}'"
     )
+    if grpo_config.remasking == "block_unmask_policy":
+        assert grpo_config.policy_type == "dit_block_unmask", (
+            f"remasking='block_unmask_policy' requires policy_type='dit_block_unmask', "
+            f"got '{grpo_config.policy_type}'"
+        )
+        # bernoulli-argmax's forced unmask is not what bernoulli_batch_loglik scores,
+        # and dpls is not wired into the per-row block loop.
+        assert grpo_config.sampling_mode == "bernoulli", (
+            f"remasking='block_unmask_policy' requires sampling_mode='bernoulli' for "
+            f"training, got '{grpo_config.sampling_mode}'"
+        )
+        assert grpo_config.block_sampling_mode == "categorical", (
+            f"remasking='block_unmask_policy' requires block_sampling_mode="
+            f"'categorical' for training, got '{grpo_config.block_sampling_mode}'"
+        )
+        assert grpo_config.policy_full_context, (
+            "remasking='block_unmask_policy' requires policy_full_context=True: blocks "
+            "are per row, so the policy must see the whole generation region"
+        )
+        assert not grpo_config.es_thresholds, (
+            "Expert steering is not supported with remasking='block_unmask_policy': "
+            "the ES expert produces no block-size actions for the policy to imitate"
+        )
     if grpo_config.remasking == "block_policy":
         assert grpo_config.policy_type in (
             "dit_block_size",
@@ -297,11 +321,33 @@ def main(grpo_config, model_config):
             time_period=grpo_config.policy_time_period,
         ).to(device)
 
+    elif grpo_config.policy_type == "dit_block_unmask":
+        hidden_dim = grpo_config.policy_hidden_dim or 128
+        feedforward_dim = grpo_config.policy_feedforward_dim or (4 * hidden_dim)
+
+        policy_core = DiTBlockUnmaskPolicy(
+            block_size_candidates=tuple(grpo_config.block_size_candidates),
+            block_size_prior_logits=(
+                tuple(grpo_config.block_size_prior_logits)
+                if grpo_config.block_size_prior_logits is not None
+                else None
+            ),
+            hidden_dim=hidden_dim,
+            feedforward_dim=feedforward_dim,
+            num_heads=grpo_config.policy_num_heads,
+            dropout=grpo_config.policy_dropout,
+            time_embed_dim=grpo_config.policy_time_embed_dim,
+            smart_init=grpo_config.policy_smart_init,
+            confidences_top_p=grpo_config.confidences_top_p,
+            num_blocks=grpo_config.policy_num_blocks,
+            time_period=grpo_config.policy_time_period,
+        ).to(device)
+
     else:
         raise ValueError(
             f"Policy type {grpo_config.policy_type} not supported. "
             "Choose from ['dit_hidden', 'dit_hidden_proj', 'dit_confidence', "
-            "'dit_block_size', 'dit_block_size_hidden_proj']"
+            "'dit_block_size', 'dit_block_size_hidden_proj', 'dit_block_unmask']"
         )
 
     policy = PolicyHFWrapper(policy_core, grpo_config.policy_type)
