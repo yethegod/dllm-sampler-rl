@@ -27,7 +27,11 @@ set -euo pipefail
 
 REPO=/u/zsun9/dllm-sampler-rl
 WORK=/work/hdd/bhta/zsun9
-OUTPUT_DIR=$WORK/checkpoints/smoke_block_unmask_cond_ddp
+# Override to smoke the conditionally independent control on the same DDP path:
+#   sbatch --export=ALL,CONFIG=configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint.yaml,TAG=indep slurm/smoke_block_unmask_cond_ddp_deltaai.sbatch
+CONFIG=${CONFIG:-configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond.yaml}
+TAG=${TAG:-cond}
+OUTPUT_DIR=$WORK/checkpoints/smoke_block_unmask_${TAG}_ddp
 
 module load python/miniforge3_pytorch
 eval "$(conda shell.bash hook)"
@@ -47,7 +51,7 @@ cd "$REPO"
 
 accelerate launch --num_processes 2 --main_process_port 29531 \
   -m train.train \
-  --config configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond.yaml \
+  --config "$CONFIG" \
   --output_dir "$OUTPUT_DIR" \
   --per_device_train_batch_size 8 \
   --generation_batch_size 16 \

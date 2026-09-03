@@ -1369,7 +1369,13 @@ class Trainer(GRPOTrainer):
             # only then gather. Gathering the ragged per-decision tensor directly
             # would hang under NCCL.
             counts_b = self.accelerator.gather_for_metrics(counts_b.unsqueeze(0)).sum(0)
-            counts_t = self.accelerator.gather_for_metrics(counts_t.unsqueeze(0)).sum(0)
+            if has_thres:
+                # block_unmask_policy has no thresholds, so counts_t is (0,): a
+                # (1, 0) all_gather fails in accelerate's reshape on >1 GPU (found by
+                # the 2-GPU smoke; a single process never gathers and hides it).
+                counts_t = self.accelerator.gather_for_metrics(
+                    counts_t.unsqueeze(0)
+                ).sum(0)
             totals = self.accelerator.gather_for_metrics(totals.unsqueeze(0)).sum(0)
             # (B,) is the same on every rank, so this one gathers safely as-is.
             per_row_blocks = self.accelerator.gather_for_metrics(
