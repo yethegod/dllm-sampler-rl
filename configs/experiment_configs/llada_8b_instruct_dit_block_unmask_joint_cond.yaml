@@ -119,3 +119,9 @@ block_size_candidates: [8, 16, 32, 48, 64, 96, 128]
 # trunk pass). The sibling config without this line is the conditionally
 # independent control (job 3076743).
 block_unmask_window_cond: true
+# The unmask head's second trunk pass doubles the policy activations kept for
+# backward: ~57 GiB at the 4xGH200 per-device batch of 32 with T~220 if the whole
+# rollout goes through compute_loss at once (~29 GiB for the independent control).
+# Chunk the time axis instead; compute_loss backwards every chunk but the last
+# under no_sync, which is gradient-equivalent (train/trainer.py:compute_loss).
+timestep_batch_size: 32
