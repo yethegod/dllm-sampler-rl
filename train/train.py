@@ -332,6 +332,7 @@ def main(grpo_config, model_config):
                 if grpo_config.block_size_prior_logits is not None
                 else None
             ),
+            window_cond=grpo_config.block_unmask_window_cond,
             hidden_dim=hidden_dim,
             feedforward_dim=feedforward_dim,
             num_heads=grpo_config.policy_num_heads,

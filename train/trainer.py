@@ -747,10 +747,13 @@ class Trainer(GRPOTrainer):
 
         The per-position Bernoulli term is always present on active steps; the
         block-size categorical term only on the step that entered a new block (the
-        last column of sampling_masks). Both heads are conditionally independent
-        given the state, so the joint log-prob is the sum. The rollout's old
-        log-probs and this recomputation must use exactly this decomposition, or the
-        GRPO ratio is not 1 on the first inner iteration.
+        last column of sampling_masks). The joint log-prob is the sum
+        log p(b | s) + log p(u | s, b): the block head never sees the window, and
+        the unmask head sees it only when the policy's window_cond is on (otherwise
+        the two are conditionally independent given the state and the sum is the
+        same formula). The rollout's old log-probs and this recomputation must use
+        exactly this decomposition, or the GRPO ratio is not 1 on the first inner
+        iteration.
 
         :param samples: (..., L+1) long, [bernoulli draws | block-size index]
         :param logits: (..., L+K) [unmask logits | block-size logits]

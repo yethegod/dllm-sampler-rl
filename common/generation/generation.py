@@ -1147,9 +1147,11 @@ def _block_unmask_policy_loop(
     Same per-row [block_start, block_end) machinery as the block_policy loop in
     generate_unified, with two differences:
 
-    - the policy runs on EVERY forward (the unmask head is needed every step) and
-      returns both heads; the block head is only sampled on the step a row enters a
-      new block, so the block decision still costs no extra NFE;
+    - the policy runs on EVERY forward (the unmask head is needed every step); the
+      block head is only evaluated and sampled on the step a row enters a new block,
+      so the block decision still costs no extra NFE. The block head is read first,
+      from the state without a live block; the unmask head is read afterwards with
+      the just-decided window, so a window-conditioned policy sees p(u | s, b);
     - Fast-dLLM thresholding is replaced by the unmask head, so there is no threshold.
 
     Recording is per forward pass (like the `policy` path), not per decision (like
@@ -1164,7 +1166,9 @@ def _block_unmask_policy_loop(
         sampling_inputs (B,T,L+K) = [unmask logits | block logits]
         samples (B,T,L+1) long = [bernoulli draws | block-size index]
         sampling_masks (B,T,L+1) bool = [in-block masked positions | made a decision]
-        policy_inputs = (m (B,T,L), c (B,T,L,P), t (B,T,1), block_start (B,T,1))
+        policy_inputs = (m (B,T,L), c (B,T,L,P), t (B,T,1), block_start (B,T,1),
+                         block_end (B,T,1)); block_end is the window AFTER this
+                         step's block decision, i.e. what the unmask head saw
         block_sizes_chosen (B,T) long (0 off-decision), block_decisions (B,T) bool
     """
     B = x.shape[0]
@@ -1193,15 +1197,16 @@ def _block_unmask_policy_loop(
         # the loss recomputes the block logits from it.
         start_in = block_start.unsqueeze(-1).clone()  # (B, 1)
 
-        unmask_logits, block_logits = policy(mask_index, c, per_batch_timestep, start_in)
-        if temperature_policy != 1.0:
-            unmask_logits = unmask_logits / temperature_policy
-            block_logits = block_logits / temperature_policy
-
-        # A row needs a new block exactly when it has no live block.
+        # A row needs a new block exactly when it has no live block. The block head
+        # is only evaluated then; off-decision steps record zeros in its slot, which
+        # the trainer masks out via the decision flag.
         needs = active & (block_start == block_end)
         b_idx = torch.zeros(B, dtype=torch.long, device=device)
+        block_logits = torch.zeros((B, K), dtype=torch.float32, device=device)
         if needs.any():
+            block_logits = policy.block_logits(mask_index, c, per_batch_timestep, start_in)
+            if temperature_policy != 1.0:
+                block_logits = block_logits / temperature_policy
             feasible = torch.isfinite(block_logits)
             if block_sampling_mode == "categorical-argmax":
                 drawn = block_logits.masked_fill(~feasible, float("-inf")).argmax(dim=-1)
@@ -1209,6 +1214,15 @@ def _block_unmask_policy_loop(
                 drawn = categorical_sample(block_logits, feasible)  # (B,)
             b_idx = torch.where(needs, drawn, b_idx)
             block_end = torch.where(needs, block_start + cand_b[b_idx], block_end)
+
+        # The window the unmask head decodes in, fixed for this step. Recorded so the
+        # loss can rebuild the same conditioning.
+        end_in = block_end.unsqueeze(-1).clone()  # (B, 1)
+        unmask_logits = policy.unmask_logits(
+            mask_index, c, per_batch_timestep, start_in, end_in
+        )
+        if temperature_policy != 1.0:
+            unmask_logits = unmask_logits / temperature_policy
 
         block_index = (positions >= block_start.unsqueeze(-1)) & (
             positions < block_end.unsqueeze(-1)
@@ -1231,6 +1245,7 @@ def _block_unmask_policy_loop(
                     c.detach(),
                     per_batch_timestep,
                     start_in,
+                    end_in,
                 ),
                 "block_sizes_chosen": torch.where(
                     needs, cand_b[b_idx], torch.zeros_like(b_idx)
@@ -1264,6 +1279,7 @@ def _block_unmask_policy_loop(
                 torch.zeros((B, 1, L), dtype=torch.bool, device=device),
                 torch.zeros((B, 1, L, confidences_top_p), device=device),
                 torch.zeros((B, 1, 1), device=device),
+                torch.zeros((B, 1, 1), dtype=torch.long, device=device),
                 torch.zeros((B, 1, 1), dtype=torch.long, device=device),
             ),
             "block_sizes_chosen": torch.zeros((B, 1), dtype=torch.long, device=device),

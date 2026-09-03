@@ -204,6 +204,17 @@ class Config(GRPOConfig):
         },
     )
 
+    block_unmask_window_cond: bool = field(
+        default=False,
+        metadata={
+            "help": "policy_type='dit_block_unmask': condition the per-position unmask "
+            "head on the sampled block window, p(u | s, b), via a zero-initialised "
+            "window embedding and a second trunk pass. False keeps the two heads "
+            "conditionally independent given the state (one trunk pass), which is "
+            "what checkpoints trained before this flag existed expect."
+        },
+    )
+
     thres: float = field(
         default=0.9,
         metadata={

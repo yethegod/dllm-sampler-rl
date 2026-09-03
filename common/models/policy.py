@@ -86,11 +86,25 @@ class PolicyHFWrapper(PreTrainedModel):
             return v.to(dtype)
         return v
 
-    def forward(self, *args, **kwargs):
-        # coerce dtypes if needed
+    def _coerce_call(self, fn, args, kwargs):
         args = tuple(self._coerce(arg, self.dtype) for arg in args)
         kwargs = {k: self._coerce(v, self.dtype) for k, v in kwargs.items()}
-        return self.base_policy(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        # coerce dtypes if needed
+        return self._coerce_call(self.base_policy, args, kwargs)
+
+    # The block_unmask decode loop calls the two heads of DiTBlockUnmaskPolicy
+    # separately (block head before the block decision, unmask head after it). They
+    # must go through the same dtype coercion as forward, so delegate explicitly:
+    # nn.Module's __getattr__ only resolves parameters and submodules, not methods
+    # of a wrapped module.
+    def block_logits(self, *args, **kwargs):
+        return self._coerce_call(self.base_policy.block_logits, args, kwargs)
+
+    def unmask_logits(self, *args, **kwargs):
+        return self._coerce_call(self.base_policy.unmask_logits, args, kwargs)
 
     def get_input_embeddings(self):
         return None
@@ -295,6 +309,7 @@ class DiTConfidencePolicy(nn.Module):
         m: torch.Tensor,
         c: torch.Tensor,
         timestep: torch.Tensor,
+        extra_cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Shared backbone up to (and including) the final norm.
 
@@ -305,6 +320,9 @@ class DiTConfidencePolicy(nn.Module):
         :param c: (*B,L,*) per-position input stream, whatever embed_input() accepts
             (top-p confidences here, dLLM hidden states in DiTHiddenProjPolicy)
         :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
+        :param extra_cond: optional (*B,L,hidden_dim) term added to the adaLN
+            conditioning stream next to the mask and time embeddings; used by
+            DiTBlockUnmaskPolicy to tell the unmask head where the current block is
         :return: (*B,L,hidden_dim) normalized hidden states
         """
         *B, L, _ = c.shape
@@ -323,6 +341,11 @@ class DiTConfidencePolicy(nn.Module):
         time_embed = time_embed.expand((*([-1] * len(B)), L, -1))
         time_embed = self.time_mlp(time_embed)
         cond = cond + time_embed
+        if extra_cond is not None:
+            assert extra_cond.shape == cond.shape, (
+                f"Unexpected {extra_cond.shape=}; expected {cond.shape}"
+            )
+            cond = cond + extra_cond.to(cond.dtype)
 
         # Embed the per-position input stream
         x = self.embed_input(c)
@@ -571,15 +594,26 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
       whose reuse of output_proj only gets near-uniform.
 
     There is no threshold head: within a block the unmask head is the decoder, so
-    Fast-dLLM's tau has nothing left to do. The two heads are conditionally
-    independent given the state; the trainer sums their log-probs per timestep, and
-    the block term is only present on the step that enters a new block.
+    Fast-dLLM's tau has nothing left to do.
+
+    Factorisation. With ``window_cond=False`` the two heads read one trunk pass and
+    are conditionally independent given the state: p(b, u | s) = p(b | s) p(u | s),
+    and the sampled b only gates which positions may be drawn. With
+    ``window_cond=True`` the unmask head is conditioned on the block it is decoding,
+    p(b, u | s) = p(b | s) p(u | s, b): a zero-initialised ``window_embedding`` marks
+    the positions in [block_start, block_end) on the adaLN conditioning stream, the
+    block head reads a trunk pass *without* that term (the state it is decided in has
+    no live block), and the unmask head reads a second pass *with* it. Zero init
+    means step 0 is identical in both modes. The trainer sums the two log-probs per
+    timestep either way; the block term is only present on the step that enters a
+    new block.
     """
 
     def __init__(
         self,
         block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
         block_size_prior_logits: tuple[float, ...] | None = None,
+        window_cond: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -593,6 +627,7 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
             persistent=False,
         )
         self.block_size_bias = nn.Parameter(init_bias)
+        self.window_cond = window_cond
 
         # Zero-init weight AND bias: every boundary score is 0, so the block logits
         # are exactly the prior. Must happen here, not in apply_smart_init, which the
@@ -602,28 +637,102 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
             self.boundary_proj.weight.data.zero_()
             self.boundary_proj.bias.data.zero_()
 
+        if window_cond:
+            # Zero-init for the same reason: the windowed trunk pass starts out equal
+            # to the plain one, so the unmask head's initial rate is still
+            # policy_smart_init's.
+            self.window_embedding = nn.Embedding(2, self.hidden_dim)
+            with torch.no_grad():
+                self.window_embedding.weight.data.zero_()
+
+    @staticmethod
+    def _window(
+        block_start: torch.Tensor, block_end: torch.Tensor, L: int
+    ) -> torch.Tensor:
+        """(*B,L) bool: positions in the row's current block [block_start, block_end)."""
+        positions = torch.arange(L, device=block_start.device)
+        return (positions >= block_start.long()) & (positions < block_end.long())
+
+    def block_logits(
+        self,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        timestep: torch.Tensor,
+        block_start: torch.Tensor,
+    ) -> torch.Tensor:
+        """Block-size head alone: trunk without the window term.
+
+        :return: (*B,K_block) block-size logits, -inf on infeasible candidates
+        """
+        u = self.boundary_proj(self.trunk(m, c, timestep)).squeeze(-1)  # (*B, L)
+        return boundary_block_logits(
+            u, block_start, self.block_size_candidates, self.block_size_bias
+        )
+
+    def unmask_logits(
+        self,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        timestep: torch.Tensor,
+        block_start: torch.Tensor,
+        block_end: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Unmask head alone: trunk with the window term when window_cond is on.
+
+        :param block_start: (*B,1) first position of the row's current block
+        :param block_end: (*B,1) one past its last position; may be None when
+            window_cond is off (it is not read)
+        :return: (*B,L) per-position unmasking logits
+        """
+        extra_cond = None
+        if self.window_cond:
+            assert block_end is not None, (
+                "window_cond=True needs block_end to condition the unmask head on"
+            )
+            L = c.shape[-2]
+            in_block = self._window(block_start, block_end, L)  # (*B, L)
+            extra_cond = self.window_embedding(in_block.long())
+        h = self.trunk(m, c, timestep, extra_cond=extra_cond)
+        return self.output_proj(h).squeeze(-1)
+
     def forward(
         self,
         m: torch.Tensor,
         c: torch.Tensor,
         timestep: torch.Tensor,
         block_start: torch.Tensor,
+        block_end: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """:param m: (*B,L) mask with 1=masked, 0=unmasked
         :param c: (*B,L,confidences_top_p) confidence values in [0,1]
         :param timestep: (*B,1) tensor with diffusion timestep (in [0, 1])
         :param block_start: (*B,1) integer index of the current block's first position
+        :param block_end: (*B,1) integer index one past the current block's last
+            position, *after* the block decision of this step; required when
+            window_cond is on, ignored otherwise
         :return: ((*B,L) unmasking logits, (*B,K_block) block-size logits)
         """
         *B, L, _ = c.shape
         assert block_start.shape == (*B, 1), (
             f"Unexpected {block_start.shape=}; batch dim(s) {B=}"
         )
+        if block_end is not None:
+            assert block_end.shape == (*B, 1), (
+                f"Unexpected {block_end.shape=}; batch dim(s) {B=}"
+            )
 
-        h = self.trunk(m, c, timestep)  # (*B, L, H)
-        unmask_logits = self.output_proj(h).squeeze(-1)  # (*B, L)
-        u = self.boundary_proj(h).squeeze(-1)  # (*B, L)
-        block_logits = boundary_block_logits(
-            u, block_start, self.block_size_candidates, self.block_size_bias
+        if not self.window_cond:
+            # One pass, two heads: the recorded and replayed numerics of the
+            # conditionally independent policy are unchanged.
+            h = self.trunk(m, c, timestep)  # (*B, L, H)
+            unmask_logits = self.output_proj(h).squeeze(-1)  # (*B, L)
+            u = self.boundary_proj(h).squeeze(-1)  # (*B, L)
+            block_logits = boundary_block_logits(
+                u, block_start, self.block_size_candidates, self.block_size_bias
+            )
+            return unmask_logits, block_logits
+
+        return (
+            self.unmask_logits(m, c, timestep, block_start, block_end),
+            self.block_logits(m, c, timestep, block_start),
         )
-        return unmask_logits, block_logits

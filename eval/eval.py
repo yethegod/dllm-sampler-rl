@@ -794,6 +794,7 @@ if __name__ == "__main__":
                     if config.block_size_prior_logits is not None
                     else None
                 ),
+                window_cond=config.block_unmask_window_cond,
                 hidden_dim=hidden_dim,
                 feedforward_dim=feedforward_dim,
                 num_heads=config.policy_num_heads,

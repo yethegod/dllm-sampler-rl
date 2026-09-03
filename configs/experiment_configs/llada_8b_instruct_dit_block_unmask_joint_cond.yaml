@@ -1,0 +1,121 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Joint (block size, per-position unmasking) policy -- formulation.md 10, item 3.
+# The categorical block-size head of llada_8b_instruct_dit_blocksize_joint.yaml
+# kept, the Fast-dLLM threshold head dropped, and the paper's per-position
+# Bernoulli unmask head (llada_8b_instruct_dit_confidence_BL32_mixture.yaml)
+# put back as the within-block decoder. One shared trunk, two heads; GRPO sums
+# the two action log-probs per timestep. Everything not listed under "Policy
+# specific" is identical to the blocksize_joint run.
+#
+# No measured constant baseline exists for this action space: the Phase 0 grid
+# is Fast-dLLM at fixed (b, tau), and the paper's BL32/BL128 policies were
+# trained at alpha=0. Recompute E[R] from those runs' generations at this alpha
+# before calling a result a win or a loss.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# The paper's group size. The joint (b, tau) run used 16 because 15 actions x
+# 2-32 decisions gave little signal per rollout; here every forward carries a
+# per-position decision as well, so 8 (twice the prompts per optimizer step)
+# is the starting point. Raise back to 16 if block_entropy sits pinned at ln 7
+# with flat reward for a few hundred steps.
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_unmask_policy (the policy picks the block length
+# per block); kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_unmask_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# Reward = 1{correct} * ((L - min(N, L) + 1) / L)^alpha. alpha=3 is a steep
+# falloff: at L=256, N=64 -> 0.44, N=32 -> 0.68, N=128 -> 0.13. Chosen by the
+# user; at alpha=0 neither head would have any reason to be fast.
+alpha_compute_reward: 3.0
+
+# Policy specific
+policy_type: dit_block_unmask
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+# Sets output_proj.bias, i.e. the unmask head: initial per-position unmask
+# probability sigmoid(-2) ~= 0.12, as in the paper. The block-size head is
+# zero-initialised separately and starts exactly uniform over feasible sizes.
+policy_smart_init: -2.0
+# Per-position head: bernoulli to train (eval passes bernoulli-argmax).
+sampling_mode: bernoulli
+# Block-size head: categorical to train (eval passes categorical-argmax).
+block_sampling_mode: categorical
+
+# 7 block sizes (ln 7 = 1.946 nats at uniform). Every candidate is a multiple
+# of 8 and L = 256, so the remaining length stays a multiple of 8, b=8 always
+# fits, and blocks tile [0, L) exactly with no partial tail. No threshold axis.
+block_size_candidates: [8, 16, 32, 48, 64, 96, 128]
+# Full factorisation p(b, u | s) = p(b | s) p(u | s, b): the unmask head is told
+# where the block it decodes starts and ends (zero-init window embedding, second
+# trunk pass). The sibling config without this line is the conditionally
+# independent control (job 3076743).
+block_unmask_window_cond: true

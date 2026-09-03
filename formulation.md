@@ -391,6 +391,12 @@ state-dependence. Report the correlation alongside the score.
    value costs one constant-baseline eval to keep §9's bar exact.
 3. Replace the within-block decoder with the paper's learned per-position policy — the shared
    trunk makes this a three-head model and the GRPO loss simply sums the action log-probs.
+   *Implemented* as `remasking="block_unmask_policy"` / `DiTBlockUnmaskPolicy` (two heads: the
+   threshold head is dropped, not kept). With `block_unmask_window_cond: true` the unmask head
+   is conditioned on the chosen block, $\pi_\theta(u \mid s_t, b_t)$, in the spirit of item 1:
+   a zero-initialised embedding of "position lies in $[\text{block\_start}, \text{block\_end})$"
+   joins the adaLN conditioning, the block head reads a trunk pass without it and the unmask
+   head a second pass with it. Off, the two heads are conditionally independent given $s_t$.
 4. Let the block boundary be an arbitrary position rather than a member of $\mathcal{B}$ — the
    boundary-scoring head already computes the required per-position scores.
 
@@ -413,6 +419,11 @@ state-dependence. Report the correlation alongside the score.
   `PolicyHFWrapper.forward` casts every tensor arg to `self.dtype`; `block_start` is an integer
   index and must be exempted (bf16 cannot represent all integers up to 256 exactly), so restrict
   the cast to floating-point tensors.
+  `DiTBlockUnmaskPolicy.forward(m, c, timestep, block_start, block_end)` takes one more integer
+  index, `block_end`, recorded by the decode loop *after* the step's block decision so that the
+  loss rebuilds the same window; it rides on the same floating-point-only cast rule. The window-
+  conditioned variant costs a second trunk pass per step in the loss and on block-entering steps
+  in the rollout; the policy is ~0.3M parameters, so this is negligible next to the dLLM forward.
 - **Sampling** — `categorical_sample` / `categorical_batch_loglik` / `categorical_entropy` in
   `common/generation/sampling.py`, alongside `bernoulli_*` and `dpls_*`.
 - **Trainer** — `compute_loss` is unchanged. Recorded rollout tensors keep the shapes the
