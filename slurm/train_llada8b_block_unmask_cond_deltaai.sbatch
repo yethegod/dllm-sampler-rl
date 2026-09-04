@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=400g
-#SBATCH --time=40:00:00
+#SBATCH --time=20:00:00
 #SBATCH --job-name=llada8b-block-unmask-cond-gh200
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT,REQUEUE
