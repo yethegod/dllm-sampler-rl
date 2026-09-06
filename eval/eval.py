@@ -845,6 +845,11 @@ if __name__ == "__main__":
     # We manage distribution manually with CustomDistributedSampler to avoid padding
     if policy is not None:
         model, policy = accelerator.prepare(model, policy)
+        # Decode with the bare wrapper, as the trainer does. accelerate wraps the
+        # policy in DistributedDataParallel on >1 process, and DDP only forwards
+        # __call__: the block_unmask loop's per-head calls (block_logits /
+        # unmask_logits) do not exist on it. No gradients here, so nothing is lost.
+        policy = accelerator.unwrap_model(policy)
     else:
         model = accelerator.prepare(model)
 

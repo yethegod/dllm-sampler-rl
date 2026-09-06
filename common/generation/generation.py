@@ -1176,6 +1176,13 @@ def _block_unmask_policy_loop(
     cand_b = torch.tensor(block_size_candidates, dtype=torch.long, device=device)
     K = len(cand_b)
 
+    # The two heads are called separately, which a DistributedDataParallel (or any
+    # other container that only forwards __call__) cannot serve: reach through to
+    # the wrapped module. The trainer and eval both pass the bare wrapper, so this
+    # is a guard, not the expected path.
+    if not hasattr(policy, "block_logits") and hasattr(policy, "module"):
+        policy = policy.module
+
     block_start = torch.zeros(B, dtype=torch.long, device=device)
     block_end = torch.zeros(B, dtype=torch.long, device=device)
     positions = torch.arange(L, device=device)

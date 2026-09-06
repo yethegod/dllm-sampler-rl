@@ -292,5 +292,39 @@ class TestThroughWrapper(unittest.TestCase):
         self.assertEqual(b.shape, (2, len(CANDIDATES)))
 
 
+class _DDPLike(torch.nn.Module):
+    """Stand-in for DistributedDataParallel: forwards __call__ only, exposes .module."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+class TestThroughDDPContainer(unittest.TestCase):
+    """accelerate wraps the policy in DDP on >1 process; the loop's per-head calls
+    must still resolve (found by eval job 3098615: 'DistributedDataParallel' object
+    has no attribute 'block_logits')."""
+
+    def test_loop_reaches_through_module(self):
+        core = _make_policy(window_cond=True)
+        _perturb(core)
+        ddp = _DDPLike(PolicyHFWrapper(core, "dit_block_unmask")).eval()
+        self.assertFalse(hasattr(ddp, "block_logits"))
+        with torch.no_grad():
+            _, rec = _run_loop(ddp, B=2)
+            unmask_logits, block_logits = ddp(*rec["policy_inputs"])
+        masks = rec["sampling_masks"]
+        pos_mask, decided = masks[..., :L], masks[..., L]
+        torch.testing.assert_close(
+            unmask_logits[pos_mask], rec["sampling_inputs"][..., :L][pos_mask]
+        )
+        torch.testing.assert_close(
+            block_logits[decided], rec["sampling_inputs"][..., L:][decided]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
