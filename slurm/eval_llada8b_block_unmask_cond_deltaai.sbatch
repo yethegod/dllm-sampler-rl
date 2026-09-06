@@ -3,10 +3,10 @@
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=400g
-#SBATCH --time=08:00:00
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200g
+#SBATCH --time=03:30:00
 #SBATCH --job-name=eval-block-unmask-cond-gh
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
