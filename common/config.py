@@ -264,6 +264,21 @@ class Config(GRPOConfig):
         },
     )
 
+    reward_count_stall_steps: bool = field(
+        default=True,
+        metadata={
+            "help": "remasking='block_unmask_policy': whether the compute term of the "
+            "reward counts forwards on which training-mode bernoulli drew nothing. "
+            "True (default, jobs 3077216/3117175) scores the reward on steps_taken, "
+            "i.e. every forward spent inside a live block. Those stalls pile up at "
+            "each block's tail (P(no draw) = (1-p)^k for k left), so they scale with "
+            "the number of blocks and eval's bernoulli-argmax never pays them -- a "
+            "block-count penalty the deployed decoder does not have. False scores the "
+            "reward on the row's productive steps instead (the forwards still happen "
+            "and num_steps_mean still reports them)."
+        },
+    )
+
     thres: float = field(
         default=0.9,
         metadata={

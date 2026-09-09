@@ -1040,6 +1040,9 @@ class Trainer(GRPOTrainer):
             generation_batch_size = self.args.generation_batch_size
             prompt_completion_ids_all = []
             num_steps_all = []
+            # What the reward is scored on: steps_taken, or the row's productive
+            # steps when reward_count_stall_steps is off (block_unmask only).
+            reward_steps_all = []
             force_es_thresholds = None
             if self.args.es_thresholds:
                 # TODO: For now we are hardcoding BL=32 for ES samples.
@@ -1114,6 +1117,13 @@ class Trainer(GRPOTrainer):
                     num_steps = result.steps_taken
                     batch_policy_inputs = result.policy_inputs
                     still_masked = result.still_masked
+                    if (
+                        not self.args.reward_count_stall_steps
+                        and result.productive_steps is not None
+                    ):
+                        reward_steps_all.append(result.productive_steps)
+                    else:
+                        reward_steps_all.append(num_steps)
 
                     # Compute log-likelihood based on sampling mode
                     old_parts = {}
@@ -1220,11 +1230,13 @@ class Trainer(GRPOTrainer):
                         }
                     )
                     num_steps_all.append(es_num_steps)
+                    reward_steps_all.append(es_num_steps)
                     prompt_completion_ids_all.append(es_prompt_completion_ids)
                     # Removed gc.collect() and empty_cache() from inner loop for better GPU utilization
 
                 prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
                 num_steps = torch.cat(num_steps_all, dim=0)
+                reward_steps = torch.cat(reward_steps_all, dim=0)
                 still_masked = torch.cat(still_masked_all, dim=0)
 
         # Compute prompt length and extract completion ids
@@ -1301,7 +1313,7 @@ class Trainer(GRPOTrainer):
                 output_reward_func = reward_func(
                     prompts=prompts,
                     completions=completions,
-                    n_steps=num_steps,
+                    n_steps=reward_steps,
                     L=gen_length,
                     alpha=self.args.alpha_compute_reward,
                     step=self._step,
@@ -1706,6 +1718,13 @@ class Trainer(GRPOTrainer):
             )
 
         # NFE metrics apply to both action types
+        if _uses_block_unmask(self.args):
+            # The stall-free count next to the raw NFE: their gap is the block-tail
+            # stall cost the training reward used to charge (~11 NFE per block in
+            # job 3117175), and the number eval's bernoulli-argmax actually reports.
+            productive = self.accelerator.gather_for_metrics(reward_steps).float()
+            productive = productive[post_gathering_policy_only_index]
+            self._metrics[mode]["num_reward_steps_mean"].append(productive.mean().item())
         num_steps = self.accelerator.gather_for_metrics(num_steps).float()
         num_steps = num_steps[post_gathering_policy_only_index]
         self._metrics[mode]["num_steps_mean"].append(num_steps.mean().item())

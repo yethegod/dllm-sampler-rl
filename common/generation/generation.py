@@ -52,6 +52,12 @@ class GenerationResult(NamedTuple):
     # block_policy this is sampling_masks[..., 0]; for block_unmask_policy the time
     # axis is per forward pass and only block-entry steps are True.
     block_decisions: torch.Tensor | None = None
+    # (B,) steps on which the row actually unmasked at least one position
+    # (remasking='block_unmask_policy' only). steps_taken also counts the forwards
+    # where training-mode bernoulli drew nothing; those are real NFE but eval's
+    # bernoulli-argmax never pays them, and they scale with the number of blocks.
+    # The trainer can score the reward on this count instead (reward_count_stall_steps).
+    productive_steps: torch.Tensor | None = None
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -1187,6 +1193,9 @@ def _block_unmask_policy_loop(
     block_end = torch.zeros(B, dtype=torch.long, device=device)
     positions = torch.arange(L, device=device)
     history = []
+    # Steps that unmasked something, next to steps_taken which counts every forward
+    # a row spent inside a live block (stalls included).
+    productive_steps = torch.zeros_like(steps_taken)
 
     for _ in range(L):
         generation_part = x[:, prompt_L:]
@@ -1264,6 +1273,7 @@ def _block_unmask_policy_loop(
         if record_order is not None:
             record_order(unmask)
         steps_taken += sampling_mask.any(dim=-1).int()
+        productive_steps += unmask.any(dim=-1).to(productive_steps.dtype)
 
         # Rows whose current block is now full advance; start == end then triggers
         # a fresh decision on the next iteration.
@@ -1291,6 +1301,7 @@ def _block_unmask_policy_loop(
             ),
             "block_sizes_chosen": torch.zeros((B, 1), dtype=torch.long, device=device),
             "block_decisions": torch.zeros((B, 1), dtype=torch.bool, device=device),
+            "productive_steps": productive_steps,
         }
 
     stacked = {
@@ -1301,6 +1312,7 @@ def _block_unmask_policy_loop(
         torch.stack(col, dim=1) for col in zip(*[h["policy_inputs"] for h in history])
     )
     stacked["block_decisions"] = stacked["sampling_masks"][..., L]
+    stacked["productive_steps"] = productive_steps
     return stacked
 
 

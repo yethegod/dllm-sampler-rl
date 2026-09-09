@@ -122,6 +122,9 @@ def main(grpo_config, model_config):
         assert not grpo_config.block_unmask_split_loss, (
             "block_unmask_split_loss only applies to remasking='block_unmask_policy'"
         )
+        assert grpo_config.reward_count_stall_steps, (
+            "reward_count_stall_steps=False only applies to remasking='block_unmask_policy'"
+        )
         assert grpo_config.policy_head_lr is None, (
             "policy_head_lr only applies to policy_type='dit_block_unmask'"
         )

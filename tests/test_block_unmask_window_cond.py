@@ -242,6 +242,19 @@ class TestRecordReplay(unittest.TestCase):
         self.assertTrue(torch.isfinite(old).all())
         torch.testing.assert_close(new, old)
 
+    def test_productive_steps_count_only_steps_that_unmasked(self):
+        # steps_taken counts every forward inside a live block; productive_steps
+        # only those on which the row drew at least one position. The reward can
+        # be scored on the latter (reward_count_stall_steps=False).
+        masks = self.rec["sampling_masks"][..., :L]
+        draws = self.rec["samples"][..., :L].bool() & masks
+        expected = draws.any(dim=-1).sum(dim=-1)
+        got = self.rec["productive_steps"]
+        self.assertEqual(got.shape, expected.shape)
+        self.assertTrue(torch.equal(got.long(), expected.long()))
+        active = masks.any(dim=-1).sum(dim=-1)
+        self.assertTrue(bool((got <= active).all()))
+
     def test_off_decision_steps_contribute_no_block_term(self):
         masks = self.rec["sampling_masks"]
         decided = masks[..., L]
