@@ -63,6 +63,24 @@ def _uses_block_unmask(args) -> bool:
     return getattr(args, "remasking", None) == "block_unmask_policy"
 
 
+def _split_block_loss(args) -> bool:
+    """block_unmask_policy with the block action as its own GRPO token stream."""
+    return _uses_block_unmask(args) and bool(
+        getattr(args, "block_unmask_split_loss", False)
+    )
+
+
+# The parameters that only the block-size action reads (plus the window embedding,
+# which is how the unmask head is told which block it is in). Matched on the dotted
+# name so the check holds through PolicyHFWrapper (base_policy.*) and DDP (module.*).
+BLOCK_HEAD_PARAM_NAMES = ("block_size_bias", "boundary_proj", "window_embedding")
+
+
+def _is_block_head_param(name: str) -> bool:
+    parts = name.split(".")
+    return any(head in parts for head in BLOCK_HEAD_PARAM_NAMES)
+
+
 class Trainer(GRPOTrainer):
     def __init__(
         self,
@@ -213,6 +231,53 @@ class Trainer(GRPOTrainer):
 
         return output
 
+    def create_optimizer(self):
+        """HF's AdamW groups, plus a separate learning rate for the block head.
+
+        Adam's update is ~lr per parameter per step whatever the gradient scale, so
+        at learning_rate=3e-5 the block head's own parameters (7 prior logits, a
+        128-vector) cannot move more than ~0.05 in an epoch even with a perfectly
+        consistent gradient -- and job 3077216 measured 0.013. The trunk learns at
+        that rate only because thousands of parameters compound. policy_head_lr
+        gives the block-head parameters their own base rate under the same AdamW,
+        warmup and cosine schedule (LambdaLR scales every group's base lr).
+        """
+        head_lr = getattr(self.args, "policy_head_lr", None)
+        if self.optimizer is not None or head_lr is None:
+            return super().create_optimizer()
+
+        opt_model = self.model
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+        groups = []
+        for is_head in (False, True):
+            for decay in (True, False):
+                params = [
+                    p
+                    for n, p in opt_model.named_parameters()
+                    if p.requires_grad
+                    and (n in decay_parameters) == decay
+                    and _is_block_head_param(n) == is_head
+                ]
+                if not params:
+                    continue
+                group = {
+                    "params": params,
+                    "weight_decay": self.args.weight_decay if decay else 0.0,
+                }
+                if is_head:
+                    group["lr"] = head_lr
+                groups.append(group)
+        assert any("lr" in g for g in groups), (
+            "policy_head_lr is set but the policy has no block-head parameters "
+            f"({BLOCK_HEAD_PARAM_NAMES}); it only applies to policy_type='dit_block_unmask'"
+        )
+        # Group 0 is the base-lr decay group, which is what Trainer logs as "learning_rate".
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+            self.args, opt_model
+        )
+        self.optimizer = optimizer_cls(groups, **optimizer_kwargs)
+        return self.optimizer
+
     def training_step(
         self,
         model: nn.Module,
@@ -228,7 +293,31 @@ class Trainer(GRPOTrainer):
         self.effective_steps += 1
 
         # Normal training step for non-zero advantages
-        return super().training_step(model, inputs, num_items_in_batch)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        if _uses_block_unmask(self.args):
+            self._log_block_head_grad_norms(model)
+        return loss
+
+    def _log_block_head_grad_norms(self, model: nn.Module) -> None:
+        """Split the (pre-clip) gradient norm into block head vs everything else.
+
+        Runs after the synchronising backward, so under DDP every rank already holds
+        the all-reduced gradients and no gather is needed. This is the direct
+        evidence of whether the block term of the loss reaches its parameters --
+        the aggregate grad_norm Trainer logs is dominated by the trunk.
+        """
+        head_sq = 0.0
+        rest_sq = 0.0
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            sq = p.grad.detach().float().pow(2).sum().item()
+            if _is_block_head_param(name):
+                head_sq += sq
+            else:
+                rest_sq += sq
+        self._metrics["train"]["grad_norm/block_head"].append(head_sq**0.5)
+        self._metrics["train"]["grad_norm/trunk_and_unmask"].append(rest_sq**0.5)
 
     def _skip_step_globally(self, inputs: dict[str, Any]) -> bool:
         """Do *all* ranks agree this step carries no learning signal?
@@ -355,6 +444,15 @@ class Trainer(GRPOTrainer):
             assert (num_active_steps > 0).all(), (
                 "At least one batch element was active for < 1 steps?"
             )
+            split_block = _split_block_loss(self.args)
+            if split_block:
+                # The block action's own token count: the decision flag is the last
+                # sampling_masks column. Every row decides at least once (its first
+                # step), so this is >= 1 except for the padded no-history case,
+                # where the flag is all False and the term is 0 anyway.
+                num_block_decisions = (
+                    batch_sampling_masks[..., -1].sum(dim=-1).clamp(min=1)
+                )  # (B,)
             for time_step_idx in range(0, T, timestep_bs):
                 chunks_done += 1
                 is_final_chunk = chunks_done == total_chunks
@@ -417,45 +515,15 @@ class Trainer(GRPOTrainer):
                             # Non-tensors just get propagated
                             time_step_batch_policy_inputs.append(ptdi)
 
-                    logps_timestep = self._get_per_timestep_logps_block(
+                    logps_timestep, entropy = self._get_per_timestep_logps_block(
                         model=model,
                         samples=time_step_batch_samples,
                         sampling_masks=time_step_batch_sampling_masks,
                         policy_inputs=time_step_batch_policy_inputs,
                         sampling_mode=self.args.sampling_mode,
                         return_entropy=True,
-                    )  # (B, timestep_bs), entropy (scalar)
-
-                    if isinstance(logps_timestep, tuple):
-                        logps_timestep, entropy = logps_timestep
-                        entropy_accumulator.append(entropy.detach())
-                    else:
-                        # Backward compatibility if return_entropy=False
-                        pass
-
-                    # For ES batches, adjust NEW log probabilities with mixture distribution
-                    if is_es_batch:
-                        logps_timestep = torch.logaddexp(
-                            log_weight_theta + logps_timestep, log_weight_dirac
-                        )
-
-                    # Get old log probabilities
-                    old_logps_slice = batch_policy_output["old_per_timestep_logps"][
-                        :, time_step_idx : time_step_idx + timestep_bs
-                    ].detach()
-
-                    # For ES batches, adjust OLD log probabilities with mixture distribution
-                    if is_es_batch:
-                        old_logps_slice = torch.logaddexp(
-                            log_weight_theta + old_logps_slice, log_weight_dirac
-                        )
-
-                    coeff_1 = torch.exp(
-                        logps_timestep - old_logps_slice
-                    )  # (B, timestep_bs)
-                    coeff_2 = torch.clamp(
-                        coeff_1, 1 - self.args.epsilon, 1 + self.args.epsilon
-                    )
+                    )  # (B, timestep_bs) [or a (pos, block) pair], entropy (scalar)
+                    entropy_accumulator.append(entropy.detach())
 
                     # Get the advantages corresponding to this batch.
                     # Note that the "advantages" are flat of shape (G,),
@@ -464,39 +532,76 @@ class Trainer(GRPOTrainer):
                     batch_advantages = (
                         inputs["advantages"][batch_index_start:batch_index_end]
                         .detach()
-                        .view((-1,) + (1,) * (coeff_1.ndim - 1))
+                        .view(-1, 1)
                     )  # (B, 1)
+                    chunk_slice = slice(time_step_idx, time_step_idx + timestep_bs)
 
-                    per_timestep_loss1 = coeff_1 * batch_advantages
-                    per_timestep_loss2 = coeff_2 * batch_advantages
-                    per_timestep_loss = torch.min(per_timestep_loss1, per_timestep_loss2)
+                    if split_block:
+                        # Two token streams, two clipped ratios. The unmask term is
+                        # what the joint path computes minus the block log-prob; the
+                        # block term is normalised by the row's decision count instead
+                        # of its step count, so ~6 block decisions are not weighted
+                        # 1/T against ~50 unmask steps (train/trainer.py:compute_loss
+                        # docstring of block_unmask_split_loss in common/config.py).
+                        pos_logps, block_logps = logps_timestep
+                        pos_term = self._clipped_surrogate(
+                            pos_logps,
+                            batch_policy_output["old_pos_logps"][:, chunk_slice],
+                            batch_advantages,
+                            time_step_batch_sampling_masks[..., :-1].any(dim=-1),
+                        )
+                        block_term = self._clipped_surrogate(
+                            block_logps,
+                            batch_policy_output["old_block_logps"][:, chunk_slice],
+                            batch_advantages,
+                            time_step_batch_sampling_masks[..., -1],
+                        )
+                        chunk_loss = (
+                            -(
+                                (pos_term.sum(dim=-1) / num_active_steps).sum()
+                                + self.args.block_loss_coef
+                                * (block_term.sum(dim=-1) / num_block_decisions).sum()
+                            )
+                            / group_size
+                        )
+                        del pos_logps, block_logps, pos_term, block_term
+                    else:
+                        # Get old log probabilities
+                        old_logps_slice = batch_policy_output["old_per_timestep_logps"][
+                            :, chunk_slice
+                        ].detach()
+                        # For ES batches, adjust NEW and OLD log probabilities with the
+                        # mixture distribution
+                        if is_es_batch:
+                            logps_timestep = torch.logaddexp(
+                                log_weight_theta + logps_timestep, log_weight_dirac
+                            )
+                            old_logps_slice = torch.logaddexp(
+                                log_weight_theta + old_logps_slice, log_weight_dirac
+                            )
+                        per_timestep_loss = self._clipped_surrogate(
+                            logps_timestep,
+                            old_logps_slice,
+                            batch_advantages,
+                            time_step_batch_sampling_masks.any(dim=-1),
+                        )
+                        # Same normalisation the whole-batch reduction used to apply,
+                        # just applied per chunk: sum over this chunk's timesteps,
+                        # divide by the batch element's active-step count, then by the
+                        # group size.
+                        chunk_loss = (
+                            -(per_timestep_loss.sum(dim=-1) / num_active_steps).sum()
+                            / group_size
+                        )
+                        del per_timestep_loss, old_logps_slice
 
-                    # Only include the loss for the active timesteps
-                    per_timestep_loss *= time_step_batch_sampling_masks.any(dim=-1).to(
-                        per_timestep_loss.dtype
-                    )
-                    # Same normalisation the whole-batch reduction used to apply, just
-                    # applied per chunk: sum over this chunk's timesteps, divide by the
-                    # batch element's active-step count, then by the group size.
-                    chunk_loss = (
-                        -(per_timestep_loss.sum(dim=-1) / num_active_steps).sum()
-                        / group_size
-                    )
                     if is_final_chunk:
                         final_chunk_loss = chunk_loss
                     else:
                         self.accelerator.backward(chunk_loss)
                     loss_acummulator = loss_acummulator + chunk_loss.detach()
 
-                    del (
-                        chunk_loss,
-                        logps_timestep,
-                        coeff_1,
-                        coeff_2,
-                        per_timestep_loss1,
-                        per_timestep_loss2,
-                        per_timestep_loss,
-                    )
+                    del chunk_loss, logps_timestep
                     torch.cuda.empty_cache()
 
             # Next batch starts where the current one left off
@@ -534,6 +639,26 @@ class Trainer(GRPOTrainer):
                 self._metrics["train"]["block_entropy"].append(gathered[1].item())
 
         return loss
+
+    def _clipped_surrogate(
+        self,
+        logps: torch.Tensor,
+        old_logps: torch.Tensor,
+        advantages: torch.Tensor,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        """GRPO's per-token clipped objective, zeroed on inactive tokens.
+
+        :param logps: (B, t) log-probs under the current policy
+        :param old_logps: (B, t) log-probs under the rollout policy
+        :param advantages: (B, 1) group-normalised advantages
+        :param active: (B, t) bool, True on the tokens that carry a real action
+        :return: (B, t) min(r A, clip(r, 1 -/+ eps) A) * active
+        """
+        ratio = torch.exp(logps - old_logps.detach())
+        clipped = torch.clamp(ratio, 1 - self.args.epsilon, 1 + self.args.epsilon)
+        surrogate = torch.min(ratio * advantages, clipped * advantages)
+        return surrogate * active.to(surrogate.dtype)
 
     def _replay_hidden_states(self, batch_policy_output, t_start, t_end):
         """Recompute the dLLM hidden states the policy saw at timesteps [t_start, t_end).
@@ -611,11 +736,14 @@ class Trainer(GRPOTrainer):
 
         # Calculate corresponding log-likelihoods under the model
         if _uses_block_unmask(self.args):
-            lls = self._block_unmask_joint_loglik(
+            pos_ll, block_ll = self._block_unmask_loglik_parts(
                 samples=samples,
                 logits=logits,
                 sampling_masks=sampling_masks,
             )
+            # Split loss: hand both streams back and let compute_loss form one
+            # ratio per stream. Otherwise the joint log-prob, one ratio per step.
+            lls = (pos_ll, block_ll) if _split_block_loss(self.args) else pos_ll + block_ll
         elif sampling_mode == "categorical":
             lls = self._categorical_joint_loglik(
                 samples=samples,
@@ -737,6 +865,32 @@ class Trainer(GRPOTrainer):
             dtype=self.args.loglikelihood_dtype,
         )
 
+    def _block_unmask_loglik_parts(
+        self,
+        samples: torch.Tensor,
+        logits: torch.Tensor,
+        sampling_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two terms of _block_unmask_joint_loglik, unsummed.
+
+        :return: ((...,) per-position Bernoulli log-lik, (...,) block-size
+            categorical log-lik; 0 on steps without a block decision)
+        """
+        n = sampling_masks.shape[-1] - 1
+        pos_ll = bernoulli_batch_loglik(
+            samples[..., :n],
+            logits[..., :n],
+            mask_index=sampling_masks[..., :n],
+            dtype=self.args.loglikelihood_dtype,
+        )
+        block_ll = categorical_batch_loglik(
+            samples[..., n],
+            logits[..., n:],
+            action_mask=sampling_masks[..., n],
+            dtype=self.args.loglikelihood_dtype,
+        )
+        return pos_ll, block_ll
+
     def _block_unmask_joint_loglik(
         self,
         samples: torch.Tensor,
@@ -760,18 +914,8 @@ class Trainer(GRPOTrainer):
         :param sampling_masks: (..., L+1) bool, [in-block masked positions | decided]
         :return: (...,) joint log-likelihood
         """
-        n = sampling_masks.shape[-1] - 1
-        pos_ll = bernoulli_batch_loglik(
-            samples[..., :n],
-            logits[..., :n],
-            mask_index=sampling_masks[..., :n],
-            dtype=self.args.loglikelihood_dtype,
-        )
-        block_ll = categorical_batch_loglik(
-            samples[..., n],
-            logits[..., n:],
-            action_mask=sampling_masks[..., n],
-            dtype=self.args.loglikelihood_dtype,
+        pos_ll, block_ll = self._block_unmask_loglik_parts(
+            samples=samples, logits=logits, sampling_masks=sampling_masks
         )
         return pos_ll + block_ll
 
@@ -954,17 +1098,34 @@ class Trainer(GRPOTrainer):
                     still_masked = result.still_masked
 
                     # Compute log-likelihood based on sampling mode
-                    mask_ll = self._compute_mask_loglikelihood(
-                        samples=batch_samples,
-                        sampling_inputs=batch_sampling_inputs,
-                        sampling_masks=batch_sampling_masks,
-                    )
+                    old_parts = {}
+                    if _uses_block_unmask(self.args):
+                        # Keep the two heads' old log-probs apart as well as summed:
+                        # the split loss forms one ratio per head from the same
+                        # rollout numbers the joint ratio would have used.
+                        pos_ll, block_ll = self._block_unmask_loglik_parts(
+                            samples=batch_samples,
+                            logits=batch_sampling_inputs,
+                            sampling_masks=batch_sampling_masks,
+                        )
+                        mask_ll = pos_ll + block_ll
+                        old_parts = {
+                            "old_pos_logps": pos_ll,
+                            "old_block_logps": block_ll,
+                        }
+                    else:
+                        mask_ll = self._compute_mask_loglikelihood(
+                            samples=batch_samples,
+                            sampling_inputs=batch_sampling_inputs,
+                            sampling_masks=batch_sampling_masks,
+                        )
 
                     policy_outputs_all.append(
                         {
                             "samples": batch_samples,
                             "sampling_masks": batch_sampling_masks,
                             "old_per_timestep_logps": mask_ll,
+                            **old_parts,
                             "prompt_length": batch_prompt_ids.shape[1],
                             "sampling_inputs": batch_sampling_inputs,
                             "policy_inputs": batch_policy_inputs,
@@ -1399,6 +1560,24 @@ class Trainer(GRPOTrainer):
                     self._metrics[mode][f"threshold/frac_{t}"].append(
                         (counts_t[i] / n_dec).item()
                     )
+            if _uses_block_unmask(self.args):
+                # The block head's own parameters, so "did it move" is readable off
+                # the scalars rather than by diffing checkpoints (job 3077216 sat at
+                # |bias| < 0.013 for a full epoch). Identical on every rank.
+                core = self.accelerator.unwrap_model(self.model)
+                core = getattr(core, "base_policy", core)
+                with torch.no_grad():
+                    for i, b in enumerate(self.args.block_size_candidates):
+                        self._metrics[mode][f"block_head/bias_{b}"].append(
+                            core.block_size_bias[i].item()
+                        )
+                    self._metrics[mode]["block_head/boundary_w_norm"].append(
+                        core.boundary_proj.weight.norm().item()
+                    )
+                    if getattr(core, "window_cond", False):
+                        self._metrics[mode]["block_head/window_emb_norm"].append(
+                            core.window_embedding.weight.norm().item()
+                        )
         if self.args.remasking in ("policy", "block_unmask_policy"):
             avg_us_all = []
             max_us_all = []

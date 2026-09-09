@@ -118,6 +118,13 @@ def main(grpo_config, model_config):
             "Expert steering is not supported with remasking='block_unmask_policy': "
             "the ES expert produces no block-size actions for the policy to imitate"
         )
+    else:
+        assert not grpo_config.block_unmask_split_loss, (
+            "block_unmask_split_loss only applies to remasking='block_unmask_policy'"
+        )
+        assert grpo_config.policy_head_lr is None, (
+            "policy_head_lr only applies to policy_type='dit_block_unmask'"
+        )
     if grpo_config.remasking == "block_policy":
         assert grpo_config.policy_type in (
             "dit_block_size",
@@ -333,6 +340,7 @@ def main(grpo_config, model_config):
                 else None
             ),
             window_cond=grpo_config.block_unmask_window_cond,
+            boundary_init_gain=grpo_config.block_unmask_boundary_init_gain,
             hidden_dim=hidden_dim,
             feedforward_dim=feedforward_dim,
             num_heads=grpo_config.policy_num_heads,

@@ -1,0 +1,154 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Joint (block size, per-position unmasking) policy, window-conditioned, v2:
+# the same run as llada_8b_instruct_dit_block_unmask_joint_cond.yaml (job
+# 3077216 -> checkpoint-1870 in $WORK/checkpoints/llada8b_block_unmask_cond)
+# with the three things that kept its block head frozen fixed. That run's block
+# marginal never left uniform: block_size_bias moved 0.013, boundary_proj 0.016,
+# window_embedding 0.005 over a full epoch, while the unmask head learned
+# (67.75% @ 29.4 NFE on GSM8K, above Fast-dLLM at the same block structure).
+#
+# Same GRPO (clipped ratio, group advantages, beta 0, num_iterations 2), same
+# reward (alpha 3), same data, same policy size, same confidence input. Only
+# the three fields under "v2 block-head fixes" differ from the v1 yaml:
+#   1. block_unmask_boundary_init_gain 1.0: v1 zero-initialised boundary_proj,
+#      so du/dh = 0 and the block term of the loss never reached the shared
+#      trunk. DiTBlockSizePolicy (the b-only run, whose block head DID move
+#      within 300 steps at this same learning_rate) never had that problem
+#      because it reused the default-initialised output_proj.
+#   2. policy_head_lr 1e-3: Adam moves a parameter by at most ~lr per step, so
+#      at 3e-5 the 7 prior logits cannot leave uniform in ~1900 steps even with
+#      a perfectly consistent gradient (they moved ~40% of that ceiling, i.e.
+#      the signal was there). The block-head group gets its own base rate under
+#      the same warmup/cosine schedule; trunk and unmask head stay at 3e-5.
+#   3. block_unmask_split_loss true: the block action gets its own GRPO token
+#      stream, normalised by the row's ~6 block decisions rather than folded
+#      into the ~50 unmask steps at 1/T weight.
+#
+# No measured constant baseline exists for this action space: the Phase 0 grid
+# is Fast-dLLM at fixed (b, tau), and the paper's BL32/BL128 policies were
+# trained at alpha=0. Recompute E[R] from those runs' generations at this alpha
+# before calling a result a win or a loss.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# The paper's group size. The joint (b, tau) run used 16 because 15 actions x
+# 2-32 decisions gave little signal per rollout; here every forward carries a
+# per-position decision as well, so 8 (twice the prompts per optimizer step)
+# is the starting point. Raise back to 16 if block_entropy sits pinned at ln 7
+# with flat reward for a few hundred steps.
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_unmask_policy (the policy picks the block length
+# per block); kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_unmask_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# Reward = 1{correct} * ((L - min(N, L) + 1) / L)^alpha. alpha=3 is a steep
+# falloff: at L=256, N=64 -> 0.44, N=32 -> 0.68, N=128 -> 0.13. Chosen by the
+# user; at alpha=0 neither head would have any reason to be fast.
+alpha_compute_reward: 3.0
+
+# Policy specific
+policy_type: dit_block_unmask
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+# Sets output_proj.bias, i.e. the unmask head: initial per-position unmask
+# probability sigmoid(-2) ~= 0.12, as in the paper. The block-size head's
+# prior (block_size_bias) starts at zero; its boundary scores do not (v2).
+policy_smart_init: -2.0
+# Per-position head: bernoulli to train (eval passes bernoulli-argmax).
+sampling_mode: bernoulli
+# Block-size head: categorical to train (eval passes categorical-argmax).
+block_sampling_mode: categorical
+
+# 7 block sizes (ln 7 = 1.946 nats at uniform). Every candidate is a multiple
+# of 8 and L = 256, so the remaining length stays a multiple of 8, b=8 always
+# fits, and blocks tile [0, L) exactly with no partial tail. No threshold axis.
+block_size_candidates: [8, 16, 32, 48, 64, 96, 128]
+# Full factorisation p(b, u | s) = p(b | s) p(u | s, b): the unmask head is told
+# where the block it decodes starts and ends (zero-init window embedding, second
+# trunk pass), exactly as in v1.
+block_unmask_window_cond: true
+
+# v2 block-head fixes (see the header). Smoke expectations that change vs v1:
+# block_entropy starts a little below ln 7 (~1.8, the boundary scores are now
+# state-dependent at init) instead of exactly 1.946, block_head/bias_* and
+# block_head/boundary_w_norm must visibly move within the first ~50 steps, and
+# grad_norm/block_head must be non-zero from step 1. The loss is still exactly 0
+# on the first inner iteration (both ratios are 1 there).
+block_unmask_boundary_init_gain: 1.0
+policy_head_lr: 1e-3
+block_unmask_split_loss: true
+block_loss_coef: 1.0
+# The unmask head's second trunk pass doubles the policy activations kept for
+# backward: ~57 GiB at the 4xGH200 per-device batch of 32 with T~220 if the whole
+# rollout goes through compute_loss at once (~29 GiB for the independent control).
+# Chunk the time axis instead; compute_loss backwards every chunk but the last
+# under no_sync, which is gradient-equivalent (train/trainer.py:compute_loss).
+timestep_batch_size: 32

@@ -127,6 +127,7 @@ class _StubTrainer:
 
     compute_loss = Trainer.compute_loss
     _get_per_timestep_logps_block = Trainer._get_per_timestep_logps_block
+    _clipped_surrogate = Trainer._clipped_surrogate
     _skip_step_globally = Trainer._skip_step_globally
 
     def __init__(self, timestep_batch_size):

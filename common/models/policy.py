@@ -587,11 +587,19 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
     - unmask: the parent's output_proj, unchanged. Per-position Bernoulli logits,
       sampled only inside the current block. policy_smart_init still sets its bias,
       so the initial decoding rate means what it means in the paper.
-    - block size: a separate, zero-initialised boundary_proj scores "end the block
-      after position i"; candidate b reads that score at block_start + b - 1 plus a
-      learnable prior (boundary_block_logits). Zero init makes the block marginal
-      exactly uniform over feasible candidates at step 0, unlike DiTBlockSizePolicy,
-      whose reuse of output_proj only gets near-uniform.
+    - block size: a separate boundary_proj scores "end the block after position i";
+      candidate b reads that score at block_start + b - 1 plus a learnable prior
+      (boundary_block_logits). ``boundary_init_gain=0`` zero-initialises it, which
+      makes the block marginal exactly uniform over feasible candidates at step 0 --
+      but also cuts the head off from the trunk: with W = 0, du/dh = 0, so the block
+      term of the GRPO loss reaches no trunk parameter and only the 7 prior logits
+      and the 128 boundary weights crawl at the base learning rate (job 3077216:
+      < 0.016 of movement in a full epoch, the block marginal never left uniform).
+      ``boundary_init_gain=g > 0`` uses nn.Linear's default weight init scaled by g
+      (bias stays 0; a constant shift of every candidate's score is invisible to the
+      softmax anyway), which is what DiTBlockSizePolicy always had by reusing
+      output_proj, and its block head did learn. The block marginal then starts
+      near-uniform in expectation, state-dependent per row.
 
     There is no threshold head: within a block the unmask head is the decoder, so
     Fast-dLLM's tau has nothing left to do.
@@ -614,6 +622,7 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
         block_size_candidates: tuple[int, ...] = (8, 16, 32, 64, 128),
         block_size_prior_logits: tuple[float, ...] | None = None,
         window_cond: bool = False,
+        boundary_init_gain: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -628,13 +637,19 @@ class DiTBlockUnmaskPolicy(DiTConfidencePolicy):
         )
         self.block_size_bias = nn.Parameter(init_bias)
         self.window_cond = window_cond
+        if boundary_init_gain < 0:
+            raise ValueError(f"boundary_init_gain must be >= 0, got {boundary_init_gain}")
+        self.boundary_init_gain = boundary_init_gain
 
-        # Zero-init weight AND bias: every boundary score is 0, so the block logits
-        # are exactly the prior. Must happen here, not in apply_smart_init, which the
-        # parent __init__ runs before this head exists.
+        # Must happen here, not in apply_smart_init, which the parent __init__ runs
+        # before this head exists. The bias is always 0: it shifts every candidate's
+        # score equally, so the softmax never sees it and it never gets a gradient.
+        # gain 0 also zeroes the weight (every boundary score 0, block logits exactly
+        # the prior, no trunk gradient from the block head -- see the class docstring);
+        # gain g keeps nn.Linear's default U(-1/sqrt(H), 1/sqrt(H)) weight times g.
         self.boundary_proj = nn.Linear(self.hidden_dim, 1)
         with torch.no_grad():
-            self.boundary_proj.weight.data.zero_()
+            self.boundary_proj.weight.data.mul_(boundary_init_gain)
             self.boundary_proj.bias.data.zero_()
 
         if window_cond:

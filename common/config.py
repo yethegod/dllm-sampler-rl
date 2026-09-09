@@ -215,6 +215,54 @@ class Config(GRPOConfig):
         },
     )
 
+    block_unmask_boundary_init_gain: float = field(
+        default=0.0,
+        metadata={
+            "help": "policy_type='dit_block_unmask': scale of the block head's "
+            "boundary_proj weight init. 0 (default, what job 3077216 trained with) "
+            "zero-initialises it, so the block marginal is exactly uniform at step 0 "
+            "but the block head has no gradient path into the shared trunk and its own "
+            "7+128 parameters crawl at learning_rate. >0 keeps nn.Linear's default "
+            "init times this gain, coupling the block head to the trunk the way "
+            "DiTBlockSizePolicy's reused output_proj always was."
+        },
+    )
+
+    policy_head_lr: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "policy_type='dit_block_unmask': learning rate for the block-head "
+            "parameter group (block_size_bias, boundary_proj, window_embedding). Same "
+            "AdamW, same warmup/cosine schedule, just a different base rate; the trunk "
+            "and unmask head stay at learning_rate. None = everything at learning_rate. "
+            "Adam moves a parameter by at most ~lr per step, so at 3e-5 the 7 block "
+            "prior logits cannot leave uniform inside one epoch (~1900 steps); this "
+            "lets them."
+        },
+    )
+
+    block_unmask_split_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "remasking='block_unmask_policy': give the block-size action its "
+            "own GRPO token stream. False (default, job 3077216): the block log-prob "
+            "is summed into the unmask log-prob of the same timestep, one clipped ratio "
+            "per timestep, averaged over the ~50 active timesteps, so the ~6 block "
+            "decisions per rollout carry ~1/T of the weight. True: two clipped ratios "
+            "per timestep, the unmask one averaged over active timesteps and the block "
+            "one over the row's block decisions, summed with block_loss_coef. Same "
+            "clipped surrogate and group advantages either way; only the per-action-"
+            "type normalisation changes."
+        },
+    )
+
+    block_loss_coef: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight of the block-size term when block_unmask_split_loss is on."
+        },
+    )
+
     thres: float = field(
         default=0.9,
         metadata={
