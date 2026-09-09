@@ -70,10 +70,12 @@ def _split_block_loss(args) -> bool:
     )
 
 
-# The parameters that only the block-size action reads (plus the window embedding,
-# which is how the unmask head is told which block it is in). Matched on the dotted
-# name so the check holds through PolicyHFWrapper (base_policy.*) and DDP (module.*).
-BLOCK_HEAD_PARAM_NAMES = ("block_size_bias", "boundary_proj", "window_embedding")
+# The parameters that only the block-size action reads. NOT the window embedding: it
+# is read by the unmask head alone (policy.py: unmask_logits), so putting it here
+# would change the unmask branch's learning rate too (job 3117175 did exactly that,
+# a confound found in review). Matched on the dotted name so the check holds through
+# PolicyHFWrapper (base_policy.*) and DDP (module.*).
+BLOCK_HEAD_PARAM_NAMES = ("block_size_bias", "boundary_proj")
 
 
 def _is_block_head_param(name: str) -> bool:
@@ -623,20 +625,29 @@ class Trainer(GRPOTrainer):
 
         # Log entropy if collected
         if entropy_accumulator:
-            mean_entropy = torch.stack(entropy_accumulator).mean(dim=0)
-            if mean_entropy.ndim == 0:
+            stacked = torch.stack(entropy_accumulator)
+            if stacked.ndim == 1:
+                mean_entropy = stacked.mean()
                 self._metrics["train"]["entropy"].append(
                     self.accelerator.gather_for_metrics(mean_entropy).mean().item()
                 )
             else:
-                # block_unmask_policy: [per-position Bernoulli entropy, block-size
-                # categorical entropy]. Logged separately -- the block one is the
-                # collapse signal (formulation.md 9), the other the decoding-rate one.
-                gathered = self.accelerator.gather_for_metrics(
-                    mean_entropy.unsqueeze(0)
-                ).mean(dim=0)
-                self._metrics["train"]["entropy"].append(gathered[0].item())
-                self._metrics["train"]["block_entropy"].append(gathered[1].item())
+                # block_unmask_policy: [pos_sum, pos_count, block_sum, block_count]
+                # per chunk. Sum over chunks and ranks, then divide, so every active
+                # position / real block decision has the same weight wherever it
+                # fell. Logged separately -- the block one is the collapse signal
+                # (formulation.md 9), the other the decoding-rate one. Note the
+                # block entropy is over *feasible* candidates, which late in a
+                # rollout are fewer than 7, so it is not comparable to ln 7 as-is.
+                sums = self.accelerator.gather_for_metrics(
+                    stacked.sum(dim=0).unsqueeze(0)
+                ).sum(dim=0)
+                self._metrics["train"]["entropy"].append(
+                    (sums[0] / sums[1].clamp(min=1)).item()
+                )
+                self._metrics["train"]["block_entropy"].append(
+                    (sums[2] / sums[3].clamp(min=1)).item()
+                )
 
         return loss
 
@@ -774,20 +785,27 @@ class Trainer(GRPOTrainer):
             if _uses_block_unmask(self.args):
                 n = sampling_masks.shape[-1] - 1
                 pos_logits, block_logits = logits[..., :n], logits[..., n:]
+                # Returned as [sum, count] pairs rather than per-chunk means: a
+                # chunk with no block decision would otherwise contribute a 0 mean
+                # at equal weight, halving the reported block entropy once T is
+                # short enough for the second chunk to hold no decision (which is
+                # what job 3117175's block_entropy did; frac_* was unaffected).
+                # compute_loss sums across chunks and ranks, then divides.
                 pos_mask = sampling_masks[..., :n].float()
                 p = torch.sigmoid(pos_logits).clamp(1e-8, 1 - 1e-8)
                 pos_entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
-                pos_entropy = (pos_entropy * pos_mask).sum() / pos_mask.sum().clamp(
-                    min=1
-                )
                 dec_mask = sampling_masks[..., n].float()
                 block_entropy = categorical_entropy(
                     block_logits, feasible_mask=torch.isfinite(block_logits)
                 )
-                block_entropy = (block_entropy * dec_mask).sum() / dec_mask.sum().clamp(
-                    min=1
+                entropy = torch.stack(
+                    [
+                        (pos_entropy * pos_mask).sum(),
+                        pos_mask.sum(),
+                        (block_entropy * dec_mask).sum(),
+                        dec_mask.sum(),
+                    ]
                 )
-                entropy = torch.stack([pos_entropy, block_entropy])
             elif sampling_mode == "categorical":
                 # Joint entropy of two independent categoricals is the sum. Averaged
                 # over real decisions only -- this is the primary collapse signal

@@ -142,6 +142,9 @@ block_unmask_window_cond: true
 # block_head/boundary_w_norm must visibly move within the first ~50 steps, and
 # grad_norm/block_head must be non-zero from step 1. The loss is still exactly 0
 # on the first inner iteration (both ratios are 1 there).
+# NOTE job 3117175 (cancelled at global step ~582 after the block head collapsed
+# onto b=128) ran with window_embedding also in the head-lr group; it is now
+# base-lr only, so a rerun of this yaml is not the same experiment.
 block_unmask_boundary_init_gain: 1.0
 policy_head_lr: 1e-3
 block_unmask_split_loss: true

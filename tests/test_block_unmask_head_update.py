@@ -159,12 +159,13 @@ class TestHeadParamNames(unittest.TestCase):
             "base_policy.block_size_bias",
             "module.base_policy.boundary_proj.weight",
             "base_policy.boundary_proj.bias",
-            "base_policy.window_embedding.weight",
         ):
             self.assertTrue(_is_block_head_param(name), name)
 
     def test_does_not_match_the_unmask_head_or_trunk(self):
         for name in (
+            # Read by the unmask head only; a head-lr group must not touch it.
+            "base_policy.window_embedding.weight",
             "base_policy.output_proj.weight",
             "base_policy.output_proj.bias",
             "base_policy.confidence_proj.weight",
@@ -405,6 +406,26 @@ class TestSplitLoss(unittest.TestCase):
         self.assertEqual(len(trainer._metrics["train"]["entropy"]), 1)
         self.assertEqual(len(trainer._metrics["train"]["block_entropy"]), 1)
         self.assertGreater(trainer._metrics["train"]["block_entropy"][0], 0.0)
+
+    def test_block_entropy_independent_of_chunking(self):
+        # Chunks without a block decision used to contribute a 0 mean at equal
+        # weight; with timestep_batch_size=3 and decisions at t=0 and t=5 only
+        # 2 of 4 chunks decide, which halved the logged value.
+        vals = {}
+        for tbs in (None, 3, 1):
+            trainer = _StubTrainer(split=True, timestep_batch_size=tbs)
+            _grads(self.model, trainer, self.out, self.adv)
+            vals[tbs] = (
+                trainer._metrics["train"]["block_entropy"][0],
+                trainer._metrics["train"]["entropy"][0],
+            )
+        for tbs in (3, 1):
+            self.assertAlmostEqual(vals[tbs][0], vals[None][0], places=5)
+            self.assertAlmostEqual(vals[tbs][1], vals[None][1], places=5)
+        # And it is the entropy of the block head's own distribution.
+        logits = self.model.block_bias.detach()
+        p = torch.softmax(logits, -1)
+        self.assertAlmostEqual(vals[None][0], float(-(p * p.log()).sum()), places=5)
 
 
 if __name__ == "__main__":

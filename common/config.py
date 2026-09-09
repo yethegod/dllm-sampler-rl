@@ -232,7 +232,8 @@ class Config(GRPOConfig):
         default=None,
         metadata={
             "help": "policy_type='dit_block_unmask': learning rate for the block-head "
-            "parameter group (block_size_bias, boundary_proj, window_embedding). Same "
+            "parameter group (block_size_bias, boundary_proj; NOT window_embedding, "
+            "which only the unmask head reads -- job 3117175 had it in this group). Same "
             "AdamW, same warmup/cosine schedule, just a different base rate; the trunk "
             "and unmask head stay at learning_rate. None = everything at learning_rate. "
             "Adam moves a parameter by at most ~lr per step, so at 3e-5 the 7 block "
