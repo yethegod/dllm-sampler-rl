@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=200g
-#SBATCH --time=03:30:00
+#SBATCH --time=05:00:00
 #SBATCH --job-name=eval-block-unmask-cond-v2-gh
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -75,6 +75,22 @@ python -m eval.pipeline "$CKPT_DIR" "$CONFIG" \
 #    initial unmask rate. This is the floor the trained checkpoint must clear.
 python -m eval.pipeline "$CKPT_DIR" "$CONFIG" \
   --checkpoints first \
+  --datasets gsm8k \
+  --seeds 42 \
+  --temperatures 1.0 \
+  --remasking block_unmask_policy \
+  --sampling_mode bernoulli-argmax \
+  --block_sampling_mode categorical-argmax \
+  --save_path "$RESULTS" \
+  --no_aggregate
+
+# 3b) The run was killed at global step ~582 (rollout ~291) after the block head
+#     collapsed onto b=128 (89% of decisions, entropy 0.17, reward slipping).
+#     checkpoint-400 is from before the slide (b=128 at ~40% of decisions,
+#     entropy ~0.5) and checkpoint-best (step 492) is the highest train reward;
+#     one greedy seed each, so the collapse can be graded against its own past.
+python -m eval.pipeline "$CKPT_DIR" "$CONFIG" \
+  --checkpoints 400,best \
   --datasets gsm8k \
   --seeds 42 \
   --temperatures 1.0 \
