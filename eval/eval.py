@@ -121,6 +121,9 @@ def evaluate(
     threshold_candidates=(0.5, 0.7, 0.9),
     block_schedule=None,
     block_sampling_mode="categorical",
+    block_unmask_fixed_schedule=None,
+    block_unmask_cond_block=None,
+    record_unmask_order=False,
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -215,8 +218,12 @@ def evaluate(
                     {
                         "block_size_candidates": tuple(block_size_candidates),
                         "block_sampling_mode": block_sampling_mode,
+                        "block_unmask_fixed_schedule": block_unmask_fixed_schedule,
+                        "block_unmask_cond_block": block_unmask_cond_block,
                     }
                 )
+            if record_unmask_order:
+                gen_kwargs["record_unmask_order"] = True
 
             result = generate_unified(**gen_kwargs)
             out = result.sequences
@@ -357,6 +364,11 @@ def evaluate(
                         "block_sizes": block_schedules[j],
                         "thresholds": thres_schedules[j],
                         "action_logits": action_logits[j],
+                        # (L,) step index at which each position was unmasked, -1
+                        # never; only with --record_unmask_order.
+                        "unmask_order": result.unmask_order[j].tolist()
+                        if result.unmask_order is not None
+                        else None,
                     }
                     for j in range(len(gt_answers))
                 ]
@@ -583,8 +595,47 @@ if __name__ == "__main__":
             "any further blocks. Both values must be in the configured candidate sets."
         ),
     )
+    parser.add_argument(
+        "--block_unmask_fixed_schedule",
+        type=str,
+        default=None,
+        help=(
+            "For --remasking block_unmask_policy: comma-separated block sizes taken "
+            "at successive block decisions instead of the block head's draw, last "
+            "entry repeating (e.g. '64' for a constant block). Probes the frozen "
+            "unmask head at a fixed block size."
+        ),
+    )
+    parser.add_argument(
+        "--block_unmask_cond_block",
+        type=int,
+        default=None,
+        help=(
+            "For --remasking block_unmask_policy with a window-conditioned policy: "
+            "tell the unmask head its block is this long while the real block stays "
+            "what the schedule/head chose. Same behaviour with and without it means "
+            "the head ignores its block conditioner."
+        ),
+    )
+    parser.add_argument(
+        "--record_unmask_order",
+        action="store_true",
+        help="Store per-example (L,) unmask step indices in the generations JSON",
+    )
     args = parser.parse_args()
     args.delimiter_ids = tuple(int(t) for t in args.delimiter_ids.split(","))
+    if args.block_unmask_fixed_schedule is not None:
+        args.block_unmask_fixed_schedule = tuple(
+            int(b) for b in args.block_unmask_fixed_schedule.split(",")
+        )
+    if (
+        args.block_unmask_fixed_schedule is not None
+        or args.block_unmask_cond_block is not None
+    ) and args.remasking != "block_unmask_policy":
+        parser.error(
+            "--block_unmask_fixed_schedule / --block_unmask_cond_block need "
+            "--remasking block_unmask_policy"
+        )
     if args.block_schedule is not None:
         args.block_schedule = tuple(
             (int(b), float(t))
@@ -885,6 +936,9 @@ if __name__ == "__main__":
         threshold_candidates=tuple(args.grpo_config.threshold_candidates),
         block_schedule=args.block_schedule,
         block_sampling_mode=args.block_sampling_mode,
+        block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
+        block_unmask_cond_block=args.block_unmask_cond_block,
+        record_unmask_order=args.record_unmask_order,
     )
 
     if accelerator.num_processes > 1:
@@ -922,7 +976,15 @@ if __name__ == "__main__":
             )
         elif args.remasking == "block_unmask_policy":
             # Block size and unmasking both come from the policy; no fixed length.
+            # The probe overrides go into the label too: aggregation groups on it,
+            # and a fixed-b or lied-to run must never average with the learned one.
             args.block_length = "blockunmask"
+            if args.block_unmask_fixed_schedule is not None:
+                args.block_length += "_fixed" + "-".join(
+                    str(b) for b in args.block_unmask_fixed_schedule
+                )
+            if args.block_unmask_cond_block is not None:
+                args.block_length += f"_cond{args.block_unmask_cond_block}"
         results.update(
             {
                 "model_path": args.model_path,
@@ -938,6 +1000,10 @@ if __name__ == "__main__":
                 "block_sampling_mode": args.block_sampling_mode
                 if args.remasking == "block_unmask_policy"
                 else None,
+                "block_unmask_fixed_schedule": list(args.block_unmask_fixed_schedule)
+                if args.block_unmask_fixed_schedule is not None
+                else None,
+                "block_unmask_cond_block": args.block_unmask_cond_block,
                 "n_test": args.n_test,
                 "few_shot": args.few_shot,
                 "adaptive_block": args.adaptive_block,

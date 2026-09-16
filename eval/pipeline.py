@@ -35,6 +35,9 @@ class EvalConfig:
     block_schedule: str | None = None
     few_shot: int | None = None
     block_sampling_mode: str | None = None
+    block_unmask_fixed_schedule: str | None = None
+    block_unmask_cond_block: int | None = None
+    record_unmask_order: bool = False
 
 
 def resolve_block_length(cfg: EvalConfig) -> int:
@@ -172,6 +175,13 @@ def run_eval(
             output_dir = Path(f"{output_dir}_blockunmask")
             if cfg.block_sampling_mode:
                 output_dir = Path(f"{output_dir}_block_{cfg.block_sampling_mode}")
+            # Probe overrides are part of the run identity (eval.eval puts them in
+            # the recorded block_length for the same reason).
+            if cfg.block_unmask_fixed_schedule:
+                tag = cfg.block_unmask_fixed_schedule.replace(",", "-")
+                output_dir = Path(f"{output_dir}_fixed{tag}")
+            if cfg.block_unmask_cond_block is not None:
+                output_dir = Path(f"{output_dir}_cond{cfg.block_unmask_cond_block}")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -216,6 +226,14 @@ def run_eval(
             cmd.extend(["--block_schedule", cfg.block_schedule])
         if cfg.block_sampling_mode:
             cmd.extend(["--block_sampling_mode", cfg.block_sampling_mode])
+        if cfg.block_unmask_fixed_schedule:
+            cmd.extend(
+                ["--block_unmask_fixed_schedule", cfg.block_unmask_fixed_schedule]
+            )
+        if cfg.block_unmask_cond_block is not None:
+            cmd.extend(["--block_unmask_cond_block", str(cfg.block_unmask_cond_block)])
+        if cfg.record_unmask_order:
+            cmd.append("--record_unmask_order")
         if cfg.few_shot is not None:
             cmd.extend(["--few_shot", str(cfg.few_shot)])
 
@@ -334,6 +352,24 @@ def main():
         help="Number of in-context examples. Default: eval.eval's per-dataset "
         "default (0 for gsm8k/math/humaneval, 3 for mbpp).",
     )
+    parser.add_argument(
+        "--block_unmask_fixed_schedule",
+        default=None,
+        help="For --remasking block_unmask_policy: comma-separated fixed block sizes "
+        "per decision (last repeats), replacing the block head's draw.",
+    )
+    parser.add_argument(
+        "--block_unmask_cond_block",
+        type=int,
+        default=None,
+        help="For --remasking block_unmask_policy: block length the window-conditioned "
+        "unmask head is told, independent of the real block.",
+    )
+    parser.add_argument(
+        "--record_unmask_order",
+        action="store_true",
+        help="Store per-position unmask step indices in the generations JSON.",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
     if args.remasking == "block_schedule" and not args.block_schedule:
@@ -372,6 +408,9 @@ def main():
             block_schedule=args.block_schedule,
             few_shot=args.few_shot,
             block_sampling_mode=args.block_sampling_mode,
+            block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
+            block_unmask_cond_block=args.block_unmask_cond_block,
+            record_unmask_order=args.record_unmask_order,
         )
         try:
             run_names.append(run_pipeline(cfg))

@@ -98,6 +98,8 @@ def generate_unified(
     threshold_candidates: tuple[float, ...] = (0.5, 0.7, 0.9),
     block_schedule: tuple[tuple[int, float], ...] | None = None,
     block_sampling_mode: str = "categorical",
+    block_unmask_fixed_schedule: tuple[int, ...] | None = None,
+    block_unmask_cond_block: int | None = None,
 ) -> GenerationResult:
     if record_probe_data and adaptive_block:
         # Only the fixed-block loop has the recording hook; the adaptive and
@@ -157,6 +159,19 @@ def generate_unified(
                 f"gen_length ({gen_length}) must be divisible by the smallest block "
                 f"candidate ({min(block_size_candidates)}) so blocks tile exactly"
             )
+        # Eval-only overrides for probing the joint policy: a fixed block schedule
+        # replaces the block head's draw (the unmask head still decodes), and
+        # cond_block lies to a window-conditioned unmask head about the block it is
+        # in while the real block stays what the schedule / head chose.
+        if block_unmask_fixed_schedule is not None:
+            bad = [b for b in block_unmask_fixed_schedule if b not in block_size_candidates]
+            if not block_unmask_fixed_schedule or bad:
+                raise ValueError(
+                    f"block_unmask_fixed_schedule {block_unmask_fixed_schedule} must be a "
+                    f"non-empty list of block_size_candidates {block_size_candidates}"
+                )
+        if block_unmask_cond_block is not None and block_unmask_cond_block <= 0:
+            raise ValueError("block_unmask_cond_block must be a positive block length")
     elif remasking == "fastdllm":
         if thres is None:
             raise ValueError("thres must be provided for remasking='fastdllm'")
@@ -613,6 +628,8 @@ def generate_unified(
             block_sampling_mode,
             confidences_top_p,
             temperature_policy,
+            fixed_schedule=block_unmask_fixed_schedule,
+            cond_block=block_unmask_cond_block,
         )
     elif not adaptive_block:
         for num_block in range(num_blocks):
@@ -1147,6 +1164,8 @@ def _block_unmask_policy_loop(
     block_sampling_mode: str,
     confidences_top_p: int,
     temperature_policy: float,
+    fixed_schedule: tuple[int, ...] | None = None,
+    cond_block: int | None = None,
 ) -> dict:
     """Decode with a learned block size AND a learned per-position unmasking policy.
 
@@ -1167,6 +1186,17 @@ def _block_unmask_policy_loop(
     L. On steps where a row makes no block decision its block slot is masked out.
 
     Mutates x and steps_taken in place (they are generate_unified's own tensors).
+
+    Eval-only probes (both default off, leaving the training numerics untouched):
+    ``fixed_schedule`` replaces the block head's draw with the k-th entry at the
+    row's k-th decision (last entry repeating; an entry that does not fit in what is
+    left of the sequence drops to the largest candidate that does), so the frozen
+    unmask head can be run at a constant block size. The block logits are still
+    computed and recorded, so ``action_logits`` stay informative. ``cond_block``
+    replaces the window told to a window-conditioned unmask head by
+    ``[block_start, block_start + cond_block)`` while the sampling mask keeps the real
+    block: if the head's behaviour does not change with it, it never learned p(u|s,b).
+    The recorded ``block_end`` is the window the head actually saw, as always.
 
     :return: dict of GenerationResult fields:
         sampling_inputs (B,T,L+K) = [unmask logits | block logits]
@@ -1193,6 +1223,14 @@ def _block_unmask_policy_loop(
     block_end = torch.zeros(B, dtype=torch.long, device=device)
     positions = torch.arange(L, device=device)
     history = []
+    # Per-row count of block decisions made so far; indexes fixed_schedule.
+    n_decided = torch.zeros(B, dtype=torch.long, device=device)
+    if fixed_schedule is not None:
+        sched_idx = torch.tensor(
+            [block_size_candidates.index(b) for b in fixed_schedule],
+            dtype=torch.long,
+            device=device,
+        )
     # Steps that unmasked something, next to steps_taken which counts every forward
     # a row spent inside a live block (stalls included).
     productive_steps = torch.zeros_like(steps_taken)
@@ -1224,16 +1262,29 @@ def _block_unmask_policy_loop(
             if temperature_policy != 1.0:
                 block_logits = block_logits / temperature_policy
             feasible = torch.isfinite(block_logits)
-            if block_sampling_mode == "categorical-argmax":
+            if fixed_schedule is not None:
+                want = sched_idx[n_decided.clamp(max=len(sched_idx) - 1)]  # (B,)
+                # Largest feasible candidate no bigger than the scheduled one; the
+                # smallest candidate always fits (gen_length tiling invariant).
+                ok = feasible & (
+                    torch.arange(K, device=device).unsqueeze(0) <= want.unsqueeze(-1)
+                )
+                drawn = (
+                    ok.long() * torch.arange(1, K + 1, device=device).unsqueeze(0)
+                ).argmax(dim=-1)
+            elif block_sampling_mode == "categorical-argmax":
                 drawn = block_logits.masked_fill(~feasible, float("-inf")).argmax(dim=-1)
             else:
                 drawn = categorical_sample(block_logits, feasible)  # (B,)
             b_idx = torch.where(needs, drawn, b_idx)
             block_end = torch.where(needs, block_start + cand_b[b_idx], block_end)
+            n_decided = n_decided + needs.long()
 
         # The window the unmask head decodes in, fixed for this step. Recorded so the
         # loss can rebuild the same conditioning.
         end_in = block_end.unsqueeze(-1).clone()  # (B, 1)
+        if cond_block is not None:
+            end_in = (block_start + cond_block).clamp(max=L).unsqueeze(-1)
         unmask_logits = policy.unmask_logits(
             mask_index, c, per_batch_timestep, start_in, end_in
         )
