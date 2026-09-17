@@ -243,7 +243,10 @@ def main():
     probes = [(b, cond, seed) for (b, cond, seed) in cells if cond is not None]
     if probes:
         say("conditioning probes: same real b, head told a different b (seed-matched)")
-        say("real b  told   acc(real)  acc(told)  NFE(real)  NFE(told)  same-correct  same-NFE  same-order  mean|dNFE|")
+        say("real b  told   acc(real)  acc(told)  NFE(real)  NFE(told)  same-correct  same-NFE  same-order  same-step0  mean|dNFE|")
+        say("  (same-order = whole trace identical; same-step0 = the first step's unmask set identical, i.e. before any")
+        say("   Bernoulli-draw divergence -- with bit-identical logits both would be 100%; a tiny logit shift flips a draw")
+        say("   somewhere and the rest of the trace diverges chaotically, so same-step0 is the cleaner sensitivity probe)")
         for (b, cond, seed) in sorted(probes, key=lambda k: (int(k[0].split('-')[0]), k[1], k[2])):
             base = cells.get((b, None, seed))
             if base is None:
@@ -259,9 +262,16 @@ def main():
                 if base[q]["order"] is not None and lied[q]["order"] is not None
             ]
             so = f"{100*np.mean(same_order):7.1f}%" if same_order else "    n/a"
+            same_step0 = [
+                [i for i, v in enumerate(base[q]["order"]) if v == 0]
+                == [i for i, v in enumerate(lied[q]["order"]) if v == 0]
+                for q in qs
+                if base[q]["order"] is not None and lied[q]["order"] is not None
+            ]
+            s0 = f"{100*np.mean(same_step0):7.1f}%" if same_step0 else "    n/a"
             say(
                 f"{b:>6s}  {cond:>4d}  {100*cb.mean():8.2f}  {100*cl.mean():8.2f}  {sb.mean():8.1f}  {sl.mean():8.1f}  "
-                f"{100*(cb==cl).mean():10.1f}%  {100*(sb==sl).mean():7.1f}%  {so}  {np.abs(sb-sl).mean():8.2f}"
+                f"{100*(cb==cl).mean():10.1f}%  {100*(sb==sl).mean():7.1f}%  {so}  {s0}  {np.abs(sb-sl).mean():8.2f}"
             )
         say("")
 

@@ -32,6 +32,10 @@
 
 set -euo pipefail
 STAGES=${1:-all}
+# Cell lists, overridable so a 2h ghx4-interactive srun can take a slice:
+#   BLOCKS="8 16 32" srun ... bash <this file> A
+BLOCKS=${BLOCKS:-"8 16 32 48 64 96 128"}
+PAIRS=${PAIRS:-"128:8 128:32 32:128 32:8 8:128"}
 
 REPO=/u/zsun9/dllm-sampler-rl
 WORK=/work/hdd/bhta/zsun9
@@ -54,7 +58,7 @@ common=(--checkpoints last --datasets gsm8k --temperatures 1.0
         --save_path "$RESULTS" --no_aggregate)
 
 if want A; then
-  for b in 8 16 32 48 64 96 128; do
+  for b in $BLOCKS; do
     echo "=== stage A: fixed b=$b seed 42 $(date)"
     python -m eval.pipeline "$CKPT_DIR" "$CONFIG" --seeds 42 \
       --block_unmask_fixed_schedule "$b" "${common[@]}"
@@ -63,7 +67,7 @@ fi
 
 if want B; then
   # real b / told b: 128/8, 128/32, 32/128, 32/8, 8/128
-  for pair in 128:8 128:32 32:128 32:8 8:128; do
+  for pair in $PAIRS; do
     b=${pair%%:*}; c=${pair##*:}
     echo "=== stage B: fixed b=$b told $c seed 42 $(date)"
     python -m eval.pipeline "$CKPT_DIR" "$CONFIG" --seeds 42 \
@@ -72,7 +76,7 @@ if want B; then
 fi
 
 if want C; then
-  for b in 8 16 32 48 64 96 128; do
+  for b in $BLOCKS; do
     echo "=== stage C: fixed b=$b seeds 43,44 $(date)"
     python -m eval.pipeline "$CKPT_DIR" "$CONFIG" --seeds 43,44 \
       --block_unmask_fixed_schedule "$b" "${common[@]}"

@@ -5,6 +5,7 @@
 """Evaluation pipeline: download checkpoint, evaluate, aggregate."""
 
 import argparse
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, replace
@@ -189,6 +190,13 @@ def run_eval(
             "launch",
             "--num_processes",
             str(torch.cuda.device_count() or 1),
+            # accelerate defaults to port 29500; two evals sharing a node (partial
+            # GPU allocations) need distinct ports.
+            *(
+                ["--main_process_port", os.environ["EVAL_MAIN_PROCESS_PORT"]]
+                if os.environ.get("EVAL_MAIN_PROCESS_PORT")
+                else []
+            ),
             "-m",
             "eval.eval",
             "--config",
