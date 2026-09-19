@@ -1,23 +1,30 @@
 #!/bin/bash
-#SBATCH --account=bhta-dtai-gh
-#SBATCH --partition=ghx4
+#SBATCH --account=bhta-delta-gpu
+#SBATCH --partition=gpuA100x8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=400g
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=480g
 #SBATCH --time=04:00:00
 #SBATCH --job-name=llada8b-block-unmask-cond-v2a0-chunk
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=sun01024@umn.edu
 
-# The alpha=0 v2 joint run (see train_llada8b_block_unmask_cond_v2a0_deltaai.sbatch
-# and the config header) cut into 4h backfill-sized chunks, DeltaAI side (4xGH200).
-# The 20h version sat in the ghx4 queue for >1 day (job 3173188); 4h is the most
-# common pending time limit on ghx4 and is what backfill actually runs.
+# The alpha=0 v2 joint run (config header:
+# configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0.yaml)
+# cut into 4h chunks, Delta side (8xA100). Same run, same OUTPUT_DIR as the
+# DeltaAI chain (train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch): the
+# config ships per_device_train_batch_size 16, and 8*16 = generation_batch_size
+# 128, so no batch-size override here. Memory is well inside 80 GB: the GH200
+# side runs 32 per device with the same timestep_batch_size 32 chunking.
+# A100s are slower per step than GH200s; the two chains just hand the same
+# checkpoints back and forth via the lock below, so pace only changes how many
+# chunks the run needs (MAX_CHUNKS). Pass a longer limit with
+# `sbatch --time=08:00:00 ...` if the gpuA100x8 queue takes 8h jobs readily.
 #
-# START:  sbatch slurm/train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch
+# START:  sbatch slurm/train_llada8b_block_unmask_cond_v2a0_chunk.sbatch
 
 # HOW THE CHAIN WORKS
 #   1. At start, this job submits one more copy of itself with
@@ -56,7 +63,7 @@ OUTPUT_DIR=$WORK/checkpoints/llada8b_block_unmask_cond_v2_a0
 DONE_MARKER=$OUTPUT_DIR/TRAIN_DONE
 LOCK=$OUTPUT_DIR/RUNNING.lock
 LOCK_STALE_SEC=900
-SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch
+SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk.sbatch
 
 CHUNK_INDEX=${CHUNK_INDEX:-1}
 MAX_CHUNKS=${MAX_CHUNKS:-14}   # 14 x 4h = 56h of wall clock, ~2x the a1 pace
@@ -69,7 +76,7 @@ if [ -f "$DONE_MARKER" ]; then
   exit 0
 fi
 
-echo "[chunk $CHUNK_INDEX/$MAX_CHUNKS] DeltaAI job $SLURM_JOB_ID on $(hostname), $(date)"
+echo "[chunk $CHUNK_INDEX/$MAX_CHUNKS] Delta job $SLURM_JOB_ID on $(hostname), $(date)"
 echo "latest checkpoint: $(ls -d "$OUTPUT_DIR"/checkpoint-[0-9]* 2>/dev/null | sed "s/.*checkpoint-//" | sort -n | tail -1 || echo none)"
 
 if [ -f "$LOCK" ]; then
@@ -81,7 +88,7 @@ if [ -f "$LOCK" ]; then
   fi
   echo "stale lock (${LOCK_AGE}s old): $(cat "$LOCK") -- taking over."
 fi
-echo "DeltaAI job $SLURM_JOB_ID host $(hostname) since $(date -Is)" > "$LOCK"
+echo "Delta job $SLURM_JOB_ID host $(hostname) since $(date -Is)" > "$LOCK"
 ( while true; do sleep 60; touch "$LOCK" 2>/dev/null || true; done ) &
 HEARTBEAT_PID=$!
 cleanup() { kill "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$LOCK"; }
@@ -99,8 +106,7 @@ else
   echo "MAX_CHUNKS=$MAX_CHUNKS reached; not queueing a successor."
 fi
 
-module load python/miniforge3_pytorch
-eval "$(conda shell.bash hook)"
+source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
 conda activate dllm
 
 export HF_HOME=$WORK/hf_cache
@@ -108,12 +114,9 @@ export OMP_NUM_THREADS=16
 mkdir -p "$HF_HOME"
 
 # --save_steps 25 overrides the config's 50 so a timed-out chunk loses less.
-# --per_device_train_batch_size 32 is mandatory on 4 GPUs (4*32 = generation_batch_size
-# 128, keeps steps_per_generation at 1; train/trainer.py asserts it).
-accelerate launch --config_file configs/accelerate_configs/4gpu_ddp.yaml \
+accelerate launch --config_file configs/accelerate_configs/8gpu_ddp.yaml \
   -m train.train \
   --config configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0.yaml \
-  --per_device_train_batch_size 32 \
   --save_steps 25 \
   --output_dir "$OUTPUT_DIR"
 
