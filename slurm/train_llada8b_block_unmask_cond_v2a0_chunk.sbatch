@@ -95,7 +95,13 @@ cleanup() { kill "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$LOCK"; }
 # EXIT covers normal completion and set -e failures; TERM/INT (Slurm time limit,
 # scancel) must also stop the script so the DONE marker below is never written.
 trap cleanup EXIT
-trap 'cleanup; trap - EXIT; exit 143' TERM INT
+# accelerate runs in the background and the script waits on it, so a TERM (Slurm
+# time limit, scancel) is handled at once instead of after Slurm's SIGKILL: forward
+# it to the launcher, wait for it, clear the lock, exit. Chunk 1 (job 3177775) ran
+# accelerate in the foreground and left RUNNING.lock behind on TIMEOUT.
+CHILD=
+on_term() { [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null || true; [ -n "$CHILD" ] && wait "$CHILD" 2>/dev/null || true; cleanup; trap - EXIT; exit 143; }
+trap on_term TERM INT
 
 # Queue the next chunk before doing anything slow.
 if [ "$CHUNK_INDEX" -lt "$MAX_CHUNKS" ]; then
@@ -118,7 +124,14 @@ accelerate launch --config_file configs/accelerate_configs/8gpu_ddp.yaml \
   -m train.train \
   --config configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0.yaml \
   --save_steps 25 \
-  --output_dir "$OUTPUT_DIR"
+  --output_dir "$OUTPUT_DIR" &
+CHILD=$!
+RC=0
+wait "$CHILD" || RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "[chunk $CHUNK_INDEX] accelerate exited $RC (time limit or error); not marking done."
+  exit "$RC"
+fi
 
 # Only reached if accelerate exited 0, i.e. trainer.train() returned: epoch done.
 date > "$DONE_MARKER"
