@@ -63,6 +63,11 @@ OUTPUT_DIR=$WORK/checkpoints/llada8b_block_unmask_cond_v2_a0
 DONE_MARKER=$OUTPUT_DIR/TRAIN_DONE
 LOCK=$OUTPUT_DIR/RUNNING.lock
 LOCK_STALE_SEC=900
+YIELD=$OUTPUT_DIR/YIELD
+# GPUs this chunk holds. A chunk arriving with MORE GPUs than the current lock
+# holder preempts it (see the lock block); equal or fewer backs off.
+WEIGHT=8
+YIELD_WAIT_SEC=900
 SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk.sbatch
 
 CHUNK_INDEX=${CHUNK_INDEX:-1}
@@ -82,14 +87,47 @@ echo "latest checkpoint: $(ls -d "$OUTPUT_DIR"/checkpoint-[0-9]* 2>/dev/null | s
 if [ -f "$LOCK" ]; then
   LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
   if [ "$LOCK_AGE" -lt "$LOCK_STALE_SEC" ]; then
-    echo "busy: $(cat "$LOCK") -- heartbeat ${LOCK_AGE}s ago. Re-queueing myself in 1h, not training."
-    sbatch --begin=now+1hour --export=ALL,CHUNK_INDEX="$CHUNK_INDEX",MAX_CHUNKS="$MAX_CHUNKS" "$SELF"
-    exit 0
+    HOLDER_WEIGHT=$(sed -n 's/.*weight=\([0-9]*\).*/\1/p' "$LOCK" | head -1)
+    HOLDER_WEIGHT=${HOLDER_WEIGHT:-99}
+    if [ "$WEIGHT" -gt "$HOLDER_WEIGHT" ]; then
+      # A smaller job holds the run. Ask it to stop (its heartbeat loop watches
+      # YIELD), then wait for the lock to clear. Progress it loses is bounded by
+      # its save_steps; this slot took days to get and is worth more.
+      echo "preempting: $(cat "$LOCK") (weight $HOLDER_WEIGHT < mine $WEIGHT). Writing YIELD and waiting up to ${YIELD_WAIT_SEC}s."
+      echo "weight=$WEIGHT job $SLURM_JOB_ID host $(hostname) $(date -Is)" > "$YIELD"
+      WAITED=0
+      while [ -f "$LOCK" ] && [ "$WAITED" -lt "$YIELD_WAIT_SEC" ]; do sleep 15; WAITED=$((WAITED + 15)); done
+      rm -f "$YIELD"
+      if [ -f "$LOCK" ]; then
+        LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
+        if [ "$LOCK_AGE" -lt "$LOCK_STALE_SEC" ]; then
+          echo "holder did not yield within ${YIELD_WAIT_SEC}s; re-queueing myself in 1h."
+          sbatch --begin=now+1hour --export=ALL,CHUNK_INDEX="$CHUNK_INDEX",MAX_CHUNKS="$MAX_CHUNKS" "$SELF"
+          exit 0
+        fi
+        echo "holder's lock went stale while waiting; taking over."
+      else
+        echo "holder yielded after ${WAITED}s; taking over."
+      fi
+    else
+      echo "busy: $(cat "$LOCK") -- heartbeat ${LOCK_AGE}s ago, weight $HOLDER_WEIGHT >= mine $WEIGHT. Re-queueing myself in 1h, not training."
+      sbatch --begin=now+1hour --export=ALL,CHUNK_INDEX="$CHUNK_INDEX",MAX_CHUNKS="$MAX_CHUNKS" "$SELF"
+      exit 0
+    fi
   fi
-  echo "stale lock (${LOCK_AGE}s old): $(cat "$LOCK") -- taking over."
+  [ -f "$LOCK" ] && echo "stale lock (${LOCK_AGE}s old): $(cat "$LOCK") -- taking over."
 fi
-echo "Delta job $SLURM_JOB_ID host $(hostname) since $(date -Is)" > "$LOCK"
-( while true; do sleep 60; touch "$LOCK" 2>/dev/null || true; done ) &
+rm -f "$YIELD"   # a stale request from an earlier arrival must not stop us
+echo "weight=$WEIGHT Delta job $SLURM_JOB_ID host $(hostname) since $(date -Is)" > "$LOCK"
+# Heartbeat, and the yield watch: a bigger job wrote YIELD -> TERM ourselves, which
+# runs on_term (stop accelerate, clear the lock, exit 143). The afterany
+# successor is already queued and will find the bigger job's lock.
+( while true; do sleep 60; touch "$LOCK" 2>/dev/null || true;
+    if [ -f "$YIELD" ]; then
+      YW=$(sed -n 's/.*weight=\([0-9]*\).*/\1/p' "$YIELD" | head -1); YW=${YW:-0}
+      if [ "$YW" -gt "$WEIGHT" ]; then echo "[chunk $CHUNK_INDEX] YIELD from $(cat "$YIELD"); stopping."; kill -TERM $$; break; fi
+    fi
+  done ) &
 HEARTBEAT_PID=$!
 cleanup() { kill "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$LOCK"; }
 # EXIT covers normal completion and set -e failures; TERM/INT (Slurm time limit,

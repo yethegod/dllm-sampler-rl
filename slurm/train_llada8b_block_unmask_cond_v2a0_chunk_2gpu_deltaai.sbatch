@@ -3,21 +3,29 @@
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=400g
-#SBATCH --time=04:00:00
-#SBATCH --job-name=llada8b-block-unmask-cond-v2a0-chunk
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=240g
+#SBATCH --time=08:00:00
+#SBATCH --job-name=llada8b-block-unmask-cond-v2a0-chunk2g
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=sun01024@umn.edu
 
-# The alpha=0 v2 joint run (see train_llada8b_block_unmask_cond_v2a0_deltaai.sbatch
-# and the config header) cut into 4h backfill-sized chunks, DeltaAI side (4xGH200).
-# The 20h version sat in the ghx4 queue for >1 day (job 3173188); 4h is the most
-# common pending time limit on ghx4 and is what backfill actually runs.
+# The alpha=0 v2 joint run (config header:
+# configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0.yaml)
+# in 8h chunks on 2xGH200, per-device batch 64. Why 2 GPUs: on ghx4 the free GPUs
+# sit 1-3 per node across ~110 partially used nodes, so a whole 4-GPU node almost
+# never opens up -- no running 4-GPU job had a limit under 8h, and the 4-GPU chain
+# (jobs 3173188/3175865/3177775/3181665) waited days per chunk. 2-GPU jobs with
+# limits up to 24h started within the hour. Each step is ~2x slower than on 4 GPUs
+# (each GPU rolls out 64 instead of 32), which the queue wait more than repays.
+# Same OUTPUT_DIR, same generation_batch_size 128, so it resumes the 4-GPU
+# checkpoints and shares the cross-cluster lock with the Delta / 4-GPU chains.
+# Validated by slurm/smoke_block_unmask_v2a0_2gpu_deltaai.sbatch (peak memory,
+# s/step at pdbs 64) before first use.
 #
-# START:  sbatch slurm/train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch
+# START:  sbatch slurm/train_llada8b_block_unmask_cond_v2a0_chunk_2gpu_deltaai.sbatch
 
 # HOW THE CHAIN WORKS
 #   1. At start, this job submits one more copy of itself with
@@ -59,12 +67,12 @@ LOCK_STALE_SEC=900
 YIELD=$OUTPUT_DIR/YIELD
 # GPUs this chunk holds. A chunk arriving with MORE GPUs than the current lock
 # holder preempts it (see the lock block); equal or fewer backs off.
-WEIGHT=4
+WEIGHT=2
 YIELD_WAIT_SEC=900
-SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch
+SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk_2gpu_deltaai.sbatch
 
 CHUNK_INDEX=${CHUNK_INDEX:-1}
-MAX_CHUNKS=${MAX_CHUNKS:-14}   # 14 x 4h = 56h of wall clock, ~2x the a1 pace
+MAX_CHUNKS=${MAX_CHUNKS:-14}   # 14 x 8h = 112h; 2 GPUs run ~half the 4-GPU step rate
 
 cd "$REPO"
 mkdir -p "$OUTPUT_DIR" "$REPO/slurm/logs"
@@ -151,14 +159,17 @@ export HF_HOME=$WORK/hf_cache
 export OMP_NUM_THREADS=16
 mkdir -p "$HF_HOME"
 
-# --save_steps 25 overrides the config's 50 so a timed-out chunk loses less.
-# --per_device_train_batch_size 32 is mandatory on 4 GPUs (4*32 = generation_batch_size
-# 128, keeps steps_per_generation at 1; train/trainer.py asserts it).
+# --save_steps 10: a 2-GPU chunk can be preempted by a 4/8-GPU arrival, so keep the
+# loss small (~40 min at ~230 s/step).
+# --per_device_train_batch_size 64 is mandatory on 2 GPUs (2*64 = generation_batch_size
+# 128, keeps steps_per_generation at 1; train/trainer.py asserts it). Same accelerate
+# settings as the 4-GPU file, with num_processes overridden on the command line.
 accelerate launch --config_file configs/accelerate_configs/4gpu_ddp.yaml \
+  --num_processes 2 --main_process_port 29542 \
   -m train.train \
   --config configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0.yaml \
-  --per_device_train_batch_size 32 \
-  --save_steps 25 \
+  --per_device_train_batch_size 64 \
+  --save_steps 10 \
   --output_dir "$OUTPUT_DIR" &
 CHILD=$!
 RC=0
