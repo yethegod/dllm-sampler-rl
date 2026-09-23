@@ -61,6 +61,13 @@ YIELD=$OUTPUT_DIR/YIELD
 # holder preempts it (see the lock block); equal or fewer backs off.
 WEIGHT=4
 YIELD_WAIT_SEC=900
+# A writer outside this protocol (e.g. a Delta job launched by hand, like wandb run
+# u1nji1hh on 2026-09-23) holds no lock but keeps saving checkpoints. Every chunk that
+# held the lock stamps LOCK_RELEASED on its way out, so a checkpoint NEWER than that
+# stamp was written by someone else; if it is also younger than FOREIGN_WRITER_SEC the
+# directory is treated as busy. 1h covers the slowest save cadence (25 steps x ~80 s).
+RELEASED=$OUTPUT_DIR/LOCK_RELEASED
+FOREIGN_WRITER_SEC=3600
 SELF=$REPO/slurm/train_llada8b_block_unmask_cond_v2a0_chunk_deltaai.sbatch
 
 CHUNK_INDEX=${CHUNK_INDEX:-1}
@@ -77,6 +84,17 @@ fi
 echo "[chunk $CHUNK_INDEX/$MAX_CHUNKS] DeltaAI job $SLURM_JOB_ID on $(hostname), $(date)"
 echo "latest checkpoint: $(ls -d "$OUTPUT_DIR"/checkpoint-[0-9]* 2>/dev/null | sed "s/.*checkpoint-//" | sort -n | tail -1 || echo none)"
 
+NEWEST=$(ls -td "$OUTPUT_DIR"/checkpoint-[0-9]* 2>/dev/null | head -1 || true)
+if [ ! -f "$LOCK" ] && [ -n "$NEWEST" ]; then
+  NEWEST_T=$(stat -c %Y "$NEWEST")
+  REL_T=0; [ -f "$RELEASED" ] && REL_T=$(stat -c %Y "$RELEASED")
+  NEWEST_AGE=$(( $(date +%s) - NEWEST_T ))
+  if [ "$NEWEST_T" -gt "$REL_T" ] && [ "$NEWEST_AGE" -lt "$FOREIGN_WRITER_SEC" ]; then
+    echo "busy: $(basename "$NEWEST") was saved ${NEWEST_AGE}s ago by a job that holds no lock. Re-queueing myself in 1h, not training."
+    sbatch --begin=now+1hour --export=ALL,CHUNK_INDEX="$CHUNK_INDEX",MAX_CHUNKS="$MAX_CHUNKS" "$SELF"
+    exit 0
+  fi
+fi
 if [ -f "$LOCK" ]; then
   LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
   if [ "$LOCK_AGE" -lt "$LOCK_STALE_SEC" ]; then
@@ -122,7 +140,7 @@ echo "weight=$WEIGHT DeltaAI job $SLURM_JOB_ID host $(hostname) since $(date -Is
     fi
   done ) &
 HEARTBEAT_PID=$!
-cleanup() { kill "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$LOCK"; }
+cleanup() { kill "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$LOCK"; date > "$RELEASED"; }
 # EXIT covers normal completion and set -e failures; TERM/INT (Slurm time limit,
 # scancel) must also stop the script so the DONE marker below is never written.
 trap cleanup EXIT
@@ -148,6 +166,10 @@ eval "$(conda shell.bash hook)"
 conda activate dllm
 
 export HF_HOME=$WORK/hf_cache
+# One wandb run for the rest of the run instead of a new one per chunk: continue the
+# Delta run u1nji1hh (steps 400+). Override with WANDB_RUN_ID=... at submit time.
+export WANDB_RUN_ID=${WANDB_RUN_ID:-u1nji1hh}
+export WANDB_RESUME=allow
 export OMP_NUM_THREADS=16
 mkdir -p "$HF_HOME"
 
