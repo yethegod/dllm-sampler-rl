@@ -189,8 +189,9 @@ class Config(GRPOConfig):
         default="bernoulli",
         metadata={
             "help": "Type of sampling strategy to use. Options: ['bernoulli', 'bernoulli-argmax', 'dpls', 'categorical']. "
-            "For remasking='block_unmask_policy' this is the per-position head's mode "
-            "('bernoulli' to train, 'bernoulli-argmax' to eval); the block-size head uses "
+            "For remasking='block_unmask_policy' this is the per-position head's mode: "
+            "'bernoulli' (eval with 'bernoulli-argmax') or 'dpls' (eval with 'dpls', or the "
+            "deterministic 'dpls-greedy') to train; the block-size head uses "
             "block_sampling_mode."
         },
     )

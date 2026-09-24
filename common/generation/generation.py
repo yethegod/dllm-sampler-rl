@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from common.generation.sampling import bernoulli_sample
 from common.generation.sampling import categorical_sample
+from common.generation.sampling import dpls_greedy
 from common.generation.sampling import dpls_sample
 from common.models.policy import HIDDEN_POLICY_TYPES
 
@@ -139,10 +140,11 @@ def generate_unified(
     elif remasking == "block_unmask_policy":
         if policy is None:
             raise ValueError("policy must be provided for remasking='block_unmask_policy'")
-        if sampling_mode not in ("bernoulli", "bernoulli-argmax"):
+        if sampling_mode not in ("bernoulli", "bernoulli-argmax", "dpls", "dpls-greedy"):
             raise ValueError(
-                "remasking='block_unmask_policy' supports sampling_mode 'bernoulli' or "
-                f"'bernoulli-argmax' for the per-position head, got {sampling_mode!r}"
+                "remasking='block_unmask_policy' supports sampling_mode 'bernoulli', "
+                "'bernoulli-argmax', 'dpls' or 'dpls-greedy' for the per-position head, "
+                f"got {sampling_mode!r}"
             )
         if block_sampling_mode not in ("categorical", "categorical-argmax"):
             raise ValueError(
@@ -630,6 +632,7 @@ def generate_unified(
             temperature_policy,
             fixed_schedule=block_unmask_fixed_schedule,
             cond_block=block_unmask_cond_block,
+            dpls_stop_logit=dpls_stop_logit,
         )
     elif not adaptive_block:
         for num_block in range(num_blocks):
@@ -1149,6 +1152,41 @@ def _bernoulli_unmask_rowwise(
     return b
 
 
+def _block_unmask_sample(
+    unmask_logits: torch.Tensor,
+    sampling_mask: torch.Tensor,
+    sampling_mode: str,
+    dpls_stop_logit: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row unmask decisions of the block_unmask loop, and what to record for the loss.
+
+    Bernoulli modes record the 0/1 draw (what bernoulli_batch_loglik scores); DPLS modes
+    record the chosen indices in the order they were drawn, padded with -1 (what
+    dpls_batch_loglik scores). Both are (B, L) long, so the packed
+    [samples | block index] layout is the same in every mode. DPLS always commits at
+    least one position of a row that has any, so it never stalls; 'dpls-greedy' is its
+    deterministic eval counterpart (see sampling.dpls_greedy).
+
+    :param unmask_logits: (B, L) per-position logits / utilities
+    :param sampling_mask: (B, L) still-masked positions inside each row's own block
+    :return: ((B, L) long record, (B, L) bool positions to unmask)
+    """
+    if sampling_mode in ("bernoulli", "bernoulli-argmax"):
+        unmask = _bernoulli_unmask_rowwise(unmask_logits, sampling_mask, sampling_mode)
+        return unmask.long(), unmask
+    if sampling_mode == "dpls":
+        sequences, unmask = dpls_sample(
+            utilities=unmask_logits, stop_logit=dpls_stop_logit, mask_index=sampling_mask
+        )
+    elif sampling_mode == "dpls-greedy":
+        sequences, unmask = dpls_greedy(
+            utilities=unmask_logits, stop_logit=dpls_stop_logit, mask_index=sampling_mask
+        )
+    else:
+        raise ValueError(f"Unknown sampling_mode for block_unmask_policy: {sampling_mode!r}")
+    return sequences.long(), unmask
+
+
 def _block_unmask_policy_loop(
     x: torch.Tensor,
     prompt_L: int,
@@ -1166,6 +1204,7 @@ def _block_unmask_policy_loop(
     temperature_policy: float,
     fixed_schedule: tuple[int, ...] | None = None,
     cond_block: int | None = None,
+    dpls_stop_logit: float = 0.0,
 ) -> dict:
     """Decode with a learned block size AND a learned per-position unmasking policy.
 
@@ -1295,7 +1334,9 @@ def _block_unmask_policy_loop(
             positions < block_end.unsqueeze(-1)
         )  # (B, L)
         sampling_mask = mask_index & block_index
-        unmask = _bernoulli_unmask_rowwise(unmask_logits, sampling_mask, sampling_mode)
+        record_samples, unmask = _block_unmask_sample(
+            unmask_logits, sampling_mask, sampling_mode, dpls_stop_logit
+        )
 
         history.append(
             {
@@ -1303,7 +1344,7 @@ def _block_unmask_policy_loop(
                     [unmask_logits.detach().float(), block_logits.detach().float()],
                     dim=-1,
                 ),
-                "samples": torch.cat([unmask.long(), b_idx.unsqueeze(-1)], dim=-1),
+                "samples": torch.cat([record_samples, b_idx.unsqueeze(-1)], dim=-1),
                 "sampling_masks": torch.cat(
                     [sampling_mask, needs.unsqueeze(-1)], dim=-1
                 ),

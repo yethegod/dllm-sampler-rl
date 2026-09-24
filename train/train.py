@@ -100,11 +100,11 @@ def main(grpo_config, model_config):
             f"remasking='block_unmask_policy' requires policy_type='dit_block_unmask', "
             f"got '{grpo_config.policy_type}'"
         )
-        # bernoulli-argmax's forced unmask is not what bernoulli_batch_loglik scores,
-        # and dpls is not wired into the per-row block loop.
-        assert grpo_config.sampling_mode == "bernoulli", (
-            f"remasking='block_unmask_policy' requires sampling_mode='bernoulli' for "
-            f"training, got '{grpo_config.sampling_mode}'"
+        # bernoulli-argmax's forced unmask is not what bernoulli_batch_loglik scores, and
+        # dpls-greedy is deterministic (eval only); bernoulli and dpls have exact likelihoods.
+        assert grpo_config.sampling_mode in ("bernoulli", "dpls"), (
+            f"remasking='block_unmask_policy' requires sampling_mode 'bernoulli' or "
+            f"'dpls' for training, got '{grpo_config.sampling_mode}'"
         )
         assert grpo_config.block_sampling_mode == "categorical", (
             f"remasking='block_unmask_policy' requires block_sampling_mode="

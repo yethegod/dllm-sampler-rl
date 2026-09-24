@@ -791,9 +791,22 @@ class Trainer(GRPOTrainer):
                 # short enough for the second chunk to hold no decision (which is
                 # what job 3117175's block_entropy did; frac_* was unaffected).
                 # compute_loss sums across chunks and ranks, then divides.
-                pos_mask = sampling_masks[..., :n].float()
-                p = torch.sigmoid(pos_logits).clamp(1e-8, 1 - 1e-8)
-                pos_entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+                if self.args.sampling_mode == "dpls":
+                    # Entropy of DPLS's first (forced) choice over the row's window,
+                    # one value per step with candidates, as in the policy+dpls branch.
+                    cand = sampling_masks[..., :n]
+                    pos_mask = cand.any(dim=-1).float()
+                    first = torch.where(
+                        cand.any(dim=-1, keepdim=True),
+                        pos_logits.float().masked_fill(~cand, float("-inf")),
+                        torch.zeros_like(pos_logits, dtype=torch.float32),
+                    )
+                    logp = torch.log_softmax(first, dim=-1).masked_fill(~cand, 0.0)
+                    pos_entropy = -(logp.exp() * logp).sum(dim=-1)
+                else:
+                    pos_mask = sampling_masks[..., :n].float()
+                    p = torch.sigmoid(pos_logits).clamp(1e-8, 1 - 1e-8)
+                    pos_entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
                 dec_mask = sampling_masks[..., n].float()
                 block_entropy = categorical_entropy(
                     block_logits, feasible_mask=torch.isfinite(block_logits)
@@ -891,16 +904,28 @@ class Trainer(GRPOTrainer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The two terms of _block_unmask_joint_loglik, unsummed.
 
-        :return: ((...,) per-position Bernoulli log-lik, (...,) block-size
-            categorical log-lik; 0 on steps without a block decision)
+        :return: ((...,) per-position log-lik -- Bernoulli, or DPLS when
+            sampling_mode='dpls' --, (...,) block-size categorical log-lik; 0 on steps
+            without a block decision)
         """
         n = sampling_masks.shape[-1] - 1
-        pos_ll = bernoulli_batch_loglik(
-            samples[..., :n],
-            logits[..., :n],
-            mask_index=sampling_masks[..., :n],
-            dtype=self.args.loglikelihood_dtype,
-        )
+        if self.args.sampling_mode == "dpls":
+            # samples[..., :n] holds the drawn indices in order, padded with -1; a step
+            # with no candidate (finished row) is all -1 and scores 0.
+            pos_ll = dpls_batch_loglik(
+                samples=samples[..., :n].long(),
+                utilities=logits[..., :n],
+                stop_logit=self.args.dpls_stop_logit,
+                mask_index=sampling_masks[..., :n],
+                dtype=self.args.loglikelihood_dtype,
+            )
+        else:
+            pos_ll = bernoulli_batch_loglik(
+                samples[..., :n],
+                logits[..., :n],
+                mask_index=sampling_masks[..., :n],
+                dtype=self.args.loglikelihood_dtype,
+            )
         block_ll = categorical_batch_loglik(
             samples[..., n],
             logits[..., n:],
@@ -1613,6 +1638,7 @@ class Trainer(GRPOTrainer):
             max_us_all = []
             non_zero_active_us_all = []
             non_zero_bs_timesteps_all = []
+            tokens_per_step_all = []
             for i in range(
                 # Drop last batch, corresponding to ES samples, if present
                 len(policy_outputs_all) - (1 if self.args.es_thresholds else 0)
@@ -1628,7 +1654,11 @@ class Trainer(GRPOTrainer):
                     # Drop the block-size columns packed after the L positions.
                     n = ms.shape[-1] - 1
                     sampling_inputs = sampling_inputs[..., :n]
-                    samples = samples[..., :n].bool()
+                    samples = samples[..., :n]
+                    if self.args.sampling_mode != "dpls":
+                        # Bernoulli draws are 0/1; DPLS records ordered indices, which
+                        # the dpls branch below turns into a set (.bool() would ruin them).
+                        samples = samples.bool()
                     ms = ms[..., :n]
 
                 # Convert to probabilities for consistent logging across sampling modes
@@ -1682,13 +1712,21 @@ class Trainer(GRPOTrainer):
                     dim=-1
                 ) / active_timesteps.sum(dim=-1)
                 non_zero_bs_timesteps_all.append(non_zero_bs_timesteps)
+                # Positions committed per step with candidates (stalled Bernoulli steps
+                # count as 0), comparable across Bernoulli and DPLS runs.
+                tokens_per_step = (bs.sum(dim=-1) * active_timesteps).sum(
+                    dim=-1
+                ) / active_timesteps.sum(dim=-1).clamp(min=1)
+                tokens_per_step_all.append(tokens_per_step.float())
 
             avg_us_all = torch.cat(avg_us_all, dim=0)
             max_us_all = torch.cat(max_us_all, dim=0)
             non_zero_active_us_all = torch.cat(non_zero_active_us_all, dim=0)
             non_zero_bs_timesteps_all = torch.cat(non_zero_bs_timesteps_all, dim=0)
+            tokens_per_step_all = torch.cat(tokens_per_step_all, dim=0)
 
             avg_us_all = self.accelerator.gather_for_metrics(avg_us_all)
+            tokens_per_step_all = self.accelerator.gather_for_metrics(tokens_per_step_all)
             non_zero_active_us_all = self.accelerator.gather_for_metrics(
                 non_zero_active_us_all
             )
@@ -1703,6 +1741,9 @@ class Trainer(GRPOTrainer):
                 non_zero_active_us_all.mean().item()
             )
             self._metrics[mode]["max_unmask_prob"].append(max_us_all.mean().item())
+            self._metrics[mode]["tokens_per_step_mean"].append(
+                tokens_per_step_all.mean().item()
+            )
 
             self._metrics[mode]["non_zero_bs_timesteps_mean"].append(
                 non_zero_bs_timesteps_all.mean().item()

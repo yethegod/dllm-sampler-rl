@@ -2,6 +2,8 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2026 Apple Inc. All Rights Reserved.
 #
+import math
+
 import torch
 
 # Construct 0-1 gumbel dist at module level to avoid realloc
@@ -257,6 +259,56 @@ def dpls_sample(
         .bool()
     )
 
+    return samples, chosen_sets
+
+
+def dpls_greedy(
+    utilities: torch.Tensor,
+    stop_logit: float,
+    mask_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic counterpart of dpls_sample, for evaluation ("median-stop greedy").
+
+    Candidates are taken in descending utility order. The first is always taken (DPLS's
+    forced first choice); the next is added while the probability that the DPLS stopping
+    process, run along this order, has not stopped yet is still >= 1/2:
+    prod_j R_j / (R_j + exp(stop_logit)), with R_j the summed weight exp(u) of the
+    candidates left after the j-th pick.
+
+    The tau -> 0 limit of DPLS (commit every utility above stop_logit) compares each
+    utility with STOP on its own, while DPLS stops on the summed weight of everything
+    left, so the two can disagree badly: with 32 equal candidates at u = -2 the limit
+    commits 1 token per step, DPLS ~4.7 on average, and this rule 4.
+
+    :param utilities: (B, BL) utility values (already divided by any policy temperature)
+    :param stop_logit: scalar stop utility
+    :param mask_index: (B, BL) bool, available positions
+    :return: (samples, chosen_sets) in dpls_sample's format: (B, BL) chosen indices in
+        order, padded with -1, and the (B, BL) bool chosen set
+    """
+    B, BL = utilities.shape
+    device = utilities.device
+    u = utilities.float().masked_fill(~mask_index, float("-inf"))
+    sorted_u, order = torch.sort(u, dim=-1, descending=True)  # (B, BL)
+    n_cand = mask_index.sum(dim=-1)  # (B,)
+
+    # rev[:, j] = logsumexp(sorted_u[:, j:]); remaining weight after the top j+1 picks is
+    # rev[:, j+1] (-inf once nothing is left).
+    rev = torch.flip(torch.logcumsumexp(torch.flip(sorted_u, dims=[-1]), dim=-1), dims=[-1])
+    log_remaining = torch.cat(
+        [rev[:, 1:], torch.full((B, 1), float("-inf"), device=device)], dim=-1
+    )
+    stop = torch.full_like(log_remaining, float(stop_logit))
+    # log P(continue after j+1 picks); -inf when no candidate is left (never NaN, since
+    # the logaddexp with the finite stop utility is finite).
+    log_continue = log_remaining - torch.logaddexp(log_remaining, stop)
+    reach = torch.cumsum(log_continue, dim=-1)  # log P(set size >= j+2), non-increasing
+    extra = (reach >= math.log(0.5)).sum(dim=-1)
+    size = torch.where(n_cand > 0, torch.minimum(1 + extra, n_cand), torch.zeros_like(n_cand))
+
+    take = torch.arange(BL, device=device).unsqueeze(0) < size.unsqueeze(-1)  # (B, BL)
+    samples = torch.where(take, order, torch.full_like(order, -1))
+    chosen_sets = torch.zeros_like(mask_index, dtype=torch.bool).scatter(-1, order, take)
     return samples, chosen_sets
 
 
