@@ -1,0 +1,149 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# v2 joint (block size, per-position unmasking) policy at alpha=1 with the unmask head
+# sampled by DPLS. Identical to llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0_dpls.yaml
+# except alpha_compute_reward 0.0 -> 1.0; the alpha=1 counterpart of the Bernoulli
+# llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha1.yaml (job 3119558).
+#
+# WHY. The Bernoulli alpha=1 run ended with a constant (128,128) block head and
+# 69.7% @ 82 NFE (E[R] 0.484 at ckpt-1200) against the best constant's 0.659
+# (Fast-dLLM t=0.7 b=64, 79.6% @ 47.2). Bernoulli's truncation at small blocks is a
+# confound for that collapse; DPLS commits >= 1 position every step and cannot
+# truncate, so here the block head's signal is correctness times the linear speed term.
+# DPLS has no stall steps, so reward_count_stall_steps (false) is inert.
+#
+# HOW TO READ IT: success = E[R] (alpha=1) above the best constant 0.659 and above
+# Fast-dLLM factor-1. Watch block_size/frac_*, block_entropy, tokens_per_step_mean
+# (should rise above the a0 ~3.4 as speed pays), still_masked == 0.
+#
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# The paper's group size. The joint (b, tau) run used 16 because 15 actions x
+# 2-32 decisions gave little signal per rollout; here every forward carries a
+# per-position decision as well, so 8 (twice the prompts per optimizer step)
+# is the starting point. Raise back to 16 if block_entropy sits pinned at ln 7
+# with flat reward for a few hundred steps.
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_unmask_policy (the policy picks the block length
+# per block); kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_unmask_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# Reward = 1{correct} * ((L - min(N, L) + 1) / L)^alpha. alpha=1 is the linear
+# setting: at L=256, N=32 -> 0.88, N=64 -> 0.75, N=128 -> 0.50.
+alpha_compute_reward: 1.0
+
+# Policy specific
+policy_type: dit_block_unmask
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+# Sets output_proj.bias, i.e. the unmask head: initial per-position unmask
+# probability sigmoid(-2) ~= 0.12, as in the paper. The block-size head's
+# prior (block_size_bias) starts at zero; its boundary scores do not (v2).
+policy_smart_init: -2.0
+# Per-position head: DPLS to train (eval passes dpls, or dpls-greedy). The ONLY change
+# from the alpha=0 Bernoulli yaml. Every step commits >= 1 position of a row's window,
+# so no row can run out of forwards; the recorded action is the ordered pick sequence.
+sampling_mode: dpls
+# DPLS STOP utility, fixed (paper default). With the unmask bias at -2 the first step
+# of a block commits ~1.8 tokens at b=8 and ~16 at b=128 (the per-step count scales
+# with the window, as it does for Bernoulli); watch tokens_per_step_mean.
+dpls_stop_logit: 0.0
+# Block-size head: categorical to train (eval passes categorical-argmax).
+block_sampling_mode: categorical
+
+# 7 block sizes (ln 7 = 1.946 nats at uniform). Every candidate is a multiple
+# of 8 and L = 256, so the remaining length stays a multiple of 8, b=8 always
+# fits, and blocks tile [0, L) exactly with no partial tail. No threshold axis.
+block_size_candidates: [8, 16, 32, 48, 64, 96, 128]
+# Full factorisation p(b, u | s) = p(b | s) p(u | s, b): the unmask head is told
+# where the block it decodes starts and ends (zero-init window embedding, second
+# trunk pass), exactly as in v1.
+block_unmask_window_cond: true
+
+# v2 block-head fixes (see the header). Smoke expectations that change vs v1:
+# block_entropy starts a little below ln 7 (~1.8, the boundary scores are now
+# state-dependent at init) instead of exactly 1.946, block_head/bias_* and
+# block_head/boundary_w_norm must visibly move within the first ~50 steps, and
+# grad_norm/block_head must be non-zero from step 1. The loss is still exactly 0
+# on the first inner iteration (both ratios are 1 there).
+# NOTE job 3117175 (cancelled at global step ~582 after the block head collapsed
+# onto b=128) ran with window_embedding also in the head-lr group; it is now
+# base-lr only, so a rerun of this yaml is not the same experiment.
+block_unmask_boundary_init_gain: 1.0
+policy_head_lr: 1e-3
+block_unmask_split_loss: true
+block_loss_coef: 1.0
+reward_count_stall_steps: false
+# The unmask head's second trunk pass doubles the policy activations kept for
+# backward: ~57 GiB at the 4xGH200 per-device batch of 32 with T~220 if the whole
+# rollout goes through compute_loss at once (~29 GiB for the independent control).
+# Chunk the time axis instead; compute_loss backwards every chunk but the last
+# under no_sync, which is gradient-equivalent (train/trainer.py:compute_loss).
+timestep_batch_size: 32
