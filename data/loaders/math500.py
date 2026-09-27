@@ -4,6 +4,7 @@
 #
 import random
 
+from datasets import load_dataset
 from datasets import load_from_disk
 
 from data.loaders.gsm8k import DATASETS_PATH
@@ -34,10 +35,21 @@ class MATH500Dataset(GSM8KDataset):
         )
 
     def load_test_dataset(self):
-        self.dataset = load_from_disk(f"{DATASETS_PATH}/math500")["test"]
+        local_path = DATASETS_PATH / "math500"
+        if local_path.exists():
+            self.dataset = load_from_disk(str(local_path))["test"]
+        else:
+            # Same 500 problems, with the reference `answer` field __getitem__ reads.
+            self.dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
 
     def load_few_shot_examples(self):
-        train_data = load_from_disk(f"{DATASETS_PATH}/hendrycks_math_algebra")["train"]
+        if self.num_examples <= 0:
+            return []
+        local_path = DATASETS_PATH / "hendrycks_math_algebra"
+        if local_path.exists():
+            train_data = load_from_disk(str(local_path))["train"]
+        else:
+            train_data = load_dataset("EleutherAI/hendrycks_math", "algebra")["train"]
         few_shot_examples = []
         samples = random.sample(range(len(train_data)), self.num_examples)
         for example in samples:

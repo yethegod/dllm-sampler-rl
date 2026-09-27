@@ -60,6 +60,21 @@ def extract_dataset_name(json_file) -> str:
     return "unknown"
 
 
+def parse_decode_mode(path) -> str:
+    """Decoding mode encoded in the output dir name by eval/pipeline.py:run_eval.
+
+    `_sampling_mode_<mode>` (per-position head) and, for block_unmask_policy,
+    `_blockunmask_block_<mode>` (block-size head). Mode names use hyphens, never underscores.
+    A greedy and a stochastic eval of one checkpoint differ only here, so this
+    is a group key; "" for dirs that carry neither suffix.
+    """
+    basename = os.path.basename(path)
+    unmask = re.search(r"_sampling_mode_([^_]+)", basename)
+    block = re.search(r"_blockunmask_block_([^_]+)", basename)
+    parts = [m.group(1) for m in (unmask, block) if m]
+    return "/".join(parts)
+
+
 def extract_run_name(json_file, results_dir):
     """Extract run name from path structure.
 
@@ -197,6 +212,7 @@ def aggregate_results(results_dir):
                 "few_shot": data.get(
                     "few_shot", LEGACY_FEW_SHOT_DEFAULTS.get(dataset_name, 0)
                 ),
+                "decode_mode": parse_decode_mode(checkpoint_dir),
                 "expected_dataset_size": expected_size,
                 "actual_samples_processed": actual_size,
                 "test_set_complete": coverage_complete,
@@ -255,6 +271,7 @@ def create_summary_tables(df, output_dir):
         "checkpoint",
         "temperature",
         "few_shot",
+        "decode_mode",
     ]
 
     agg_dict = {
@@ -302,6 +319,7 @@ def create_summary_tables(df, output_dir):
             display_df["Checkpoint"] = [idx[1] for idx in dataset_stats.index]
             display_df["Temp"] = [f"{idx[2]:.2f}" for idx in dataset_stats.index]
             display_df["Shots"] = [f"{idx[3]}" for idx in dataset_stats.index]
+            display_df["Decode"] = [idx[4] or "-" for idx in dataset_stats.index]
 
             display_df["Accuracy"] = [
                 f"{row['accuracy_mean']:.2f}% +/- {row['accuracy_std']:.2f}"
@@ -396,7 +414,7 @@ def create_summary_tables(df, output_dir):
                 f.write(f"\nResults for {dataset.upper()}, BL={bl}:\n")
                 f.write("-" * 95 + "\n")
 
-                header = f"{'Run':>20} {'Checkpoint':>15} {'Temp':>6} {'Shots':>6} {'Accuracy':>12} {'Std':>8} {'Seeds':>6}"
+                header = f"{'Run':>20} {'Checkpoint':>15} {'Temp':>6} {'Shots':>6} {'Decode':>30} {'Accuracy':>12} {'Std':>8} {'Seeds':>6}"
                 if has_steps:
                     header += f" {'NFEs':>15}"
                 if has_wall_time:
@@ -408,11 +426,11 @@ def create_summary_tables(df, output_dir):
 
                 for idx in sorted(
                     dataset_stats.index,
-                    key=lambda x: (x[0], isinstance(x[1], str), x[1], x[2], x[3]),
+                    key=lambda x: (x[0], isinstance(x[1], str), x[1], x[2], x[3], x[4]),
                 ):
-                    run, checkpoint, temp, few_shot = idx
+                    run, checkpoint, temp, few_shot, decode = idx
                     row = dataset_stats.loc[idx]
-                    line = f"{run:>20} {checkpoint:>15} {temp:>6.2f} {few_shot:>6} {row['accuracy_mean']:>8.2f}% +/- {row['accuracy_std']:>4.2f} {int(row['num_seeds']):>6}"
+                    line = f"{run:>20} {checkpoint:>15} {temp:>6.2f} {few_shot:>6} {decode or '-':>30} {row['accuracy_mean']:>8.2f}% +/- {row['accuracy_std']:>4.2f} {int(row['num_seeds']):>6}"
                     if has_steps and "avg_steps_mean" in row.index:
                         line += f" {row['avg_steps_mean']:>6.1f} +/- {row['avg_steps_std']:>4.1f}"
                     if has_wall_time and "avg_wall_time_mean" in row.index:
