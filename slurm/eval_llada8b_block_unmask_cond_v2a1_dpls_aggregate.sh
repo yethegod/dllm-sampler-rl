@@ -2,8 +2,12 @@
 # Aggregate the alpha=1 DPLS block_unmask eval (eval_llada8b_block_unmask_cond_v2a1_dpls_deltaai.sbatch)
 # next to the GSM8K fixed-(b,tau) grid, BL32, and the Bernoulli v2 a1 run. CPU only.
 set -euo pipefail
-module load python/miniforge3_pytorch
-eval "$(conda shell.bash hook)"
+if [ "$(uname -m)" = aarch64 ]; then  # DeltaAI
+  module load python/miniforge3_pytorch
+  eval "$(conda shell.bash hook)"
+else                                  # Delta
+  source /sw/rh9.4/python/miniforge3/etc/profile.d/conda.sh
+fi
 conda activate dllm
 WORK=/work/hdd/bhta/zsun9
 RESULTS=${RESULTS:-$WORK/eval_results/llada8b_block_unmask_cond_v2_a1_dpls}
