@@ -73,6 +73,9 @@ case "$TASK" in
      policy math dpls categorical ;;
   3) baseline 0.7 64
      baseline 0.9 32 ;;
+  # Task 3 split in two, for the 2h ghx4-interactive cap (TASK=3a / TASK=3b).
+  3a) baseline 0.7 64 ;;
+  3b) baseline 0.9 32 ;;
   *) echo "unknown task $TASK"; exit 2 ;;
 esac
 echo "=== task $TASK done $(date) ==="

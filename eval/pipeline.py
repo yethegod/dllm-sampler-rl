@@ -39,6 +39,7 @@ class EvalConfig:
     block_unmask_fixed_schedule: str | None = None
     block_unmask_cond_block: int | None = None
     record_unmask_order: bool = False
+    record_policy_trace: bool = False
 
 
 def resolve_block_length(cfg: EvalConfig) -> int:
@@ -183,6 +184,10 @@ def run_eval(
                 output_dir = Path(f"{output_dir}_fixed{tag}")
             if cfg.block_unmask_cond_block is not None:
                 output_dir = Path(f"{output_dir}_cond{cfg.block_unmask_cond_block}")
+            # A traced run is usually an --n_test slice: never let it overwrite the
+            # full run's generations.
+            if cfg.record_policy_trace:
+                output_dir = Path(f"{output_dir}_trace")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -242,6 +247,8 @@ def run_eval(
             cmd.extend(["--block_unmask_cond_block", str(cfg.block_unmask_cond_block)])
         if cfg.record_unmask_order:
             cmd.append("--record_unmask_order")
+        if cfg.record_policy_trace:
+            cmd.append("--record_policy_trace")
         if cfg.few_shot is not None:
             cmd.extend(["--few_shot", str(cfg.few_shot)])
 
@@ -378,6 +385,11 @@ def main():
         action="store_true",
         help="Store per-position unmask step indices in the generations JSON.",
     )
+    parser.add_argument(
+        "--record_policy_trace",
+        action="store_true",
+        help="block_unmask_policy: store the per-forward block/unmask trace.",
+    )
     parser.add_argument("--no_aggregate", action="store_true")
     args = parser.parse_args()
     if args.remasking == "block_schedule" and not args.block_schedule:
@@ -419,6 +431,7 @@ def main():
             block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
             block_unmask_cond_block=args.block_unmask_cond_block,
             record_unmask_order=args.record_unmask_order,
+            record_policy_trace=args.record_policy_trace,
         )
         try:
             run_names.append(run_pipeline(cfg))

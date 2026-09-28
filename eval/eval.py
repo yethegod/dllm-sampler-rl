@@ -61,6 +61,64 @@ FEW_SHOT_DEFAULTS = {
     "mbpp": 3,
 }
 
+DULTRA_GSM_SYSTEM_PROMPT = r"""You are a math expert.
+Follow these rules:
+1) Carefully read the question and identify what is being asked.
+2) Solve the problem step by step, showing the intermediate reasoning.
+3) Present the final answer inside \boxed{}.
+"""
+
+
+def _block_unmask_traces(result, sampling_mode):
+    """Per-example, per-forward record of what the block_unmask policy did.
+
+    One dict per forward on which the row still had masked positions in its block:
+      t      forward index
+      bs/be  the block window [bs, be) the unmask head saw
+      b      block size chosen on this forward (None when no new block was opened)
+      pos    still-masked positions inside the window (absolute, 0..L-1)
+      logit  unmask-head logit (DPLS utility) at each of `pos`
+      conf   dLLM top-1 probability at each of `pos`
+      pick   positions committed this forward, in DPLS draw order
+    The block head's full distribution is already in `action_logits`.
+    """
+    L = result.sampling_masks.shape[-1] - 1
+    ulogits = result.sampling_inputs[..., :L].float().cpu()
+    samples = result.samples[..., :L].cpu()
+    smask = result.sampling_masks[..., :L].cpu()
+    decided = result.block_decisions.cpu()
+    chosen_b = result.block_sizes_chosen.cpu()
+    conf = result.policy_inputs[1][..., 0].float().cpu()  # (B, T, L) top-1 prob
+    bstart = result.policy_inputs[3][..., 0].cpu()
+    bend = result.policy_inputs[4][..., 0].cpu()
+    dpls = sampling_mode.startswith("dpls")
+    traces = []
+    for j in range(ulogits.shape[0]):
+        rows = []
+        for t in range(ulogits.shape[1]):
+            m = smask[j, t]
+            if not m.any():
+                continue
+            pos = m.nonzero(as_tuple=True)[0]
+            if dpls:
+                pick = [p for p in samples[j, t].tolist() if p >= 0]
+            else:
+                pick = (samples[j, t] > 0).nonzero(as_tuple=True)[0].tolist()
+            rows.append(
+                {
+                    "t": t,
+                    "bs": int(bstart[j, t]),
+                    "be": int(bend[j, t]),
+                    "b": int(chosen_b[j, t]) if bool(decided[j, t]) else None,
+                    "pos": pos.tolist(),
+                    "logit": [round(v, 3) for v in ulogits[j, t, pos].tolist()],
+                    "conf": [round(v, 4) for v in conf[j, t, pos].tolist()],
+                    "pick": pick,
+                }
+            )
+        traces.append(rows)
+    return traces
+
 
 def init_seed(seed):
     random.seed(seed)
@@ -124,6 +182,7 @@ def evaluate(
     block_unmask_fixed_schedule=None,
     block_unmask_cond_block=None,
     record_unmask_order=False,
+    record_policy_trace=False,
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -252,6 +311,7 @@ def evaluate(
             # reports a single shared list; block_policy chooses per row, so unpack
             # each row's real decisions (padded slots are dropped via sampling_masks).
             n_out = len(generated_texts)
+            policy_traces = [None] * n_out
             block_schedules = [result.block_sizes] * n_out
             thres_schedules = [None] * n_out
             avg_block_sizes = [avg_block_size] * n_out
@@ -295,6 +355,8 @@ def evaluate(
                         }
                         for row in logits
                     ]
+                if record_policy_trace and not has_thres:
+                    policy_traces = _block_unmask_traces(result, sampling_mode)
 
             batch_wall_time = time.time() - start_time
             wall_time_per_sample = batch_wall_time / len(generated_texts)
@@ -369,6 +431,8 @@ def evaluate(
                         "unmask_order": result.unmask_order[j].tolist()
                         if result.unmask_order is not None
                         else None,
+                        # Per-forward block_unmask trace; only with --record_policy_trace.
+                        "policy_trace": policy_traces[j],
                     }
                     for j in range(len(gt_answers))
                 ]
@@ -553,6 +617,11 @@ if __name__ == "__main__":
     parser.add_argument("--thres", type=float, default=0.7)
     parser.add_argument("--n_test", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--dultra_prompt",
+        action="store_true",
+        help="Use the dUltra-os eval_math GSM8K prompt (no <reasoning> tag) for cross-repo comparison",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--temperature_policy", type=float, default=1.0)
     parser.add_argument(
@@ -621,6 +690,13 @@ if __name__ == "__main__":
         "--record_unmask_order",
         action="store_true",
         help="Store per-example (L,) unmask step indices in the generations JSON",
+    )
+    parser.add_argument(
+        "--record_policy_trace",
+        action="store_true",
+        help="remasking=block_unmask_policy: store every forward's window, block "
+        "decision, per-position unmask logits and dLLM confidence for the window's "
+        "masked positions, and the positions committed (see _block_unmask_traces)",
     )
     args = parser.parse_args()
     args.delimiter_ids = tuple(int(t) for t in args.delimiter_ids.split(","))
@@ -878,6 +954,10 @@ if __name__ == "__main__":
     }
     if args.dataset in ["gsm8k", "math"]:
         dataset_kwargs["add_reasoning"] = True
+    if args.dultra_prompt:
+        # dUltra-os eval_math prompt: plain \boxed{} instruction, no <reasoning> tag.
+        dataset_kwargs["add_reasoning"] = False
+        dataset_kwargs["system_prompt"] = DULTRA_GSM_SYSTEM_PROMPT
     dataset = DATASET_MAP[args.dataset](**dataset_kwargs)
 
     # take only first args.n_test examples
@@ -939,6 +1019,7 @@ if __name__ == "__main__":
         block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
         block_unmask_cond_block=args.block_unmask_cond_block,
         record_unmask_order=args.record_unmask_order,
+        record_policy_trace=args.record_policy_trace,
     )
 
     if accelerator.num_processes > 1:
