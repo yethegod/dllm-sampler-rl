@@ -8,6 +8,7 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
+from common.generation.cadllm import cadllm_loop
 from common.generation.sampling import bernoulli_sample
 from common.generation.sampling import categorical_sample
 from common.generation.sampling import dpls_greedy
@@ -177,6 +178,12 @@ def generate_unified(
     elif remasking == "fastdllm":
         if thres is None:
             raise ValueError("thres must be provided for remasking='fastdllm'")
+    elif remasking == "cadllm":
+        # Eval-only baseline with its own block / threshold schedule; see cadllm.py.
+        if prompt.shape[0] != 1:
+            raise ValueError("remasking='cadllm' requires batch size 1")
+        if temperature != 0.0:
+            raise ValueError("remasking='cadllm' is ported for temperature 0 only")
     elif remasking in ["low_confidence", "random"]:
         if steps is None:
             raise ValueError(f"steps must be provided for remasking='{remasking}'")
@@ -633,6 +640,23 @@ def generate_unified(
             fixed_schedule=block_unmask_fixed_schedule,
             cond_block=block_unmask_cond_block,
             dpls_stop_logit=dpls_stop_logit,
+        )
+    elif remasking == "cadllm":
+        # Top-V confidences need the raw logits, so skip _forward_logits' full softmax.
+        def _gen_logits():
+            logits = model(x, attention_mask=_attn_mask).logits
+            if model_type == "Dream":
+                return logits[:, prompt_L - 1 : -1]
+            return logits[:, prompt_L:]
+
+        block_sizes = cadllm_loop(
+            x,
+            prompt_L,
+            L,
+            mask_id,
+            _gen_logits,
+            steps_taken,
+            _record_order if record_unmask_order else None,
         )
     elif not adaptive_block:
         for num_block in range(num_blocks):

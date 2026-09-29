@@ -1055,6 +1055,9 @@ if __name__ == "__main__":
             args.block_length = "sched" + ",".join(
                 f"{b}:{t}" for b, t in args.block_schedule
             )
+        elif args.remasking == "cadllm":
+            # CadLLM picks every block length itself; --block_length is unused.
+            args.block_length = "cadllm"
         elif args.remasking == "block_unmask_policy":
             # Block size and unmasking both come from the policy; no fixed length.
             # The probe overrides go into the label too: aggregation groups on it,
@@ -1076,7 +1079,7 @@ if __name__ == "__main__":
                 "policy_path": args.policy_path,
                 "thres": None
                 if args.remasking
-                in ("block_policy", "block_schedule", "block_unmask_policy")
+                in ("block_policy", "block_schedule", "block_unmask_policy", "cadllm")
                 else args.thres,
                 "block_sampling_mode": args.block_sampling_mode
                 if args.remasking == "block_unmask_policy"
