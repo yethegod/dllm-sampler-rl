@@ -101,11 +101,19 @@ def load_cells(results_dir: str, checkpoint=None):
     L = None
     for f in sorted(glob.glob(os.path.join(results_dir, "**", "gsm8k*generations.json"), recursive=True)):
         data = json.load(open(f))
-        if data.get("remasking") != "block_unmask_policy":
+        remasking = data.get("remasking")
+        if remasking not in ("block_unmask_policy", "policy"):
             continue
-        sched = data.get("block_unmask_fixed_schedule")
-        cond = data.get("block_unmask_cond_block")
-        mode = data.get("block_sampling_mode")
+        # A plain per-position policy run at a fixed block_length is the same kind
+        # of cell as a block_unmask run with a fixed schedule (head x horizon).
+        if remasking == "policy":
+            sched = [int(data["block_length"])]
+            cond = None
+            mode = None
+        else:
+            sched = data.get("block_unmask_fixed_schedule")
+            cond = data.get("block_unmask_cond_block")
+            mode = data.get("block_sampling_mode")
         m = re.search(r"checkpoint-([^_/]+)_", f)
         ckpt = m.group(1) if m else "?"
         if checkpoint is not None and ckpt != str(checkpoint):
