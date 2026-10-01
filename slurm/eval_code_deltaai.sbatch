@@ -1,0 +1,71 @@
+#!/bin/bash
+#SBATCH --account=bhta-dtai-gh
+#SBATCH --partition=ghx4
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=100g
+#SBATCH --time=02:00:00
+#SBATCH --array=0-3
+#SBATCH --job-name=eval-code-gh
+#SBATCH --output=slurm/logs/%x_%A_%a.out
+
+# HumanEval (0-shot) + MBPP (3-shot, lm-eval format), pass@1, L=256, no KV cache.
+# The alpha=1 DPLS block_unmask policy (trained on gsm8k_and_math only, so this is
+# math -> code transfer) against the training-free baselines:
+#
+#   0  a1 DPLS ckpt-1870, greedy: dpls-greedy unmask + categorical-argmax block
+#   1  Fast-dLLM t0.9 b32
+#   2  AdaBlock t0.9, B0=32, tau_D 0.3 (Fast-dLLM t0.9 underneath)
+#   3  CadLLM, per-task settings from its released eval_humaneval.sh / eval_mbpp.sh
+#
+# GH200 only (greedy decodes differ between A100 and GH200). All four are
+# deterministic, so seed 42 only. Each task fits the 2h ghx4-interactive cap: run as
+#   srun --account=bhta-dtai-gh --partition=ghx4-interactive --gpus-per-node=2 ... \
+#     env TASK=<n> bash slurm/eval_code_deltaai.sbatch
+# 2 GPUs per task: never 1 (eval.py's sampler needs a process group).
+
+set -euo pipefail
+
+REPO=/u/zsun9/dllm-sampler-rl
+WORK=/work/hdd/bhta/zsun9
+RESULTS=${RESULTS:-$WORK/eval_results/code}
+CKPT_DIR=$WORK/checkpoints/llada8b_block_unmask_cond_v2_a1_dpls
+POLICY_CONFIG=configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha1_dpls.yaml
+BASE_CONFIG=configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.yaml
+DATASETS=${DATASETS:-humaneval,mbpp}
+# Extra pipeline flags, e.g. EXTRA="--n_test 4" for a smoke.
+read -r -a EXTRA <<< "${EXTRA:-}"
+
+module load python/miniforge3_pytorch
+eval "$(conda shell.bash hook)"
+conda activate dllm
+export HF_HOME=$WORK/hf_cache
+export HF_ALLOW_CODE_EVAL=1
+export OMP_NUM_THREADS=8
+export EVAL_MAIN_PROCESS_PORT=$((29500 + ${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID} % 400 * 5 + ${SLURM_ARRAY_TASK_ID:-${TASK:-0}}))
+
+mkdir -p "$RESULTS" "$REPO/slurm/logs"
+cd "$REPO"
+TASK=${TASK:-$SLURM_ARRAY_TASK_ID}
+echo "=== task $TASK on $(hostname) $(date) port=$EVAL_MAIN_PROCESS_PORT ==="
+
+base() {  # base <run name> <save subdir> [pipeline flags...]
+  local run=$1 sub=$2; shift 2
+  python -m eval.pipeline "$run" "$BASE_CONFIG" --checkpoints self --datasets "$DATASETS" \
+    --seeds 42 --temperatures 1.0 "$@" \
+    --save_path "$RESULTS/$sub" --no_aggregate "${EXTRA[@]}"
+}
+
+case "$TASK" in
+  0) python -m eval.pipeline "$CKPT_DIR" "$POLICY_CONFIG" --checkpoints 1870 \
+       --datasets "$DATASETS" --seeds 42 --temperatures 1.0 --remasking block_unmask_policy \
+       --sampling_mode dpls-greedy --block_sampling_mode categorical-argmax \
+       --save_path "$RESULTS/a1_dpls" --no_aggregate "${EXTRA[@]}" ;;
+  1) base baseline-fastdllm-t0.9 fixed/t0.9_bl32 --block_length 32 ;;
+  2) base baseline-fastdllm-t0.9 ada --block_length 32 --adaptive_block --delimiter_threshold 0.3 ;;
+  3) base baseline-cadllm cadllm ;;
+  *) echo "unknown task $TASK"; exit 2 ;;
+esac
+echo "=== task $TASK done $(date) ==="

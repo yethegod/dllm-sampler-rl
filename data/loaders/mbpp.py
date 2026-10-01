@@ -4,6 +4,7 @@
 #
 import numpy as np
 import torch
+from datasets import load_dataset
 from datasets import load_from_disk
 
 from data.loaders.gsm8k import DATASETS_PATH
@@ -34,11 +35,19 @@ class MBPPDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.subsample)
 
+    def _load_splits(self):
+        local_path = DATASETS_PATH / "mbpp"
+        if local_path.exists():
+            return load_from_disk(str(local_path))
+        # The "full" config: 500 test problems plus the 10-problem "prompt" split
+        # (task_ids 1-10) that lm-eval draws its few-shot examples from.
+        return load_dataset("google-research-datasets/mbpp", "full")
+
     def load_test_dataset(self):
-        self.dataset = load_from_disk(f"{DATASETS_PATH}/mbpp")["test"]
+        self.dataset = self._load_splits()["test"]
 
     def load_few_shot_examples(self):
-        prompt_data = load_from_disk(f"{DATASETS_PATH}/mbpp")["prompt"]
+        prompt_data = self._load_splits()["prompt"]
         n_examples = min(self.num_examples, len(prompt_data))
         return [prompt_data[i] for i in range(n_examples)]
 

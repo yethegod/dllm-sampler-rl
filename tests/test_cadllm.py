@@ -93,6 +93,18 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(cadllm.next_block_steps([0.5, 0.5], 48), 114)
         self.assertEqual(cadllm.next_block_steps([1.0, 1.0], 4), 4)
 
+    def test_task_settings(self):
+        # eval_humaneval.sh: B0 48, S0 16, max_steps 32, block in [12, 96]
+        he = cadllm.settings_for("humaneval")
+        self.assertEqual(cadllm.next_block_length([], 256, he), 48)
+        self.assertEqual(cadllm.next_block_length([1.0, 1.0], 256, he), 96)
+        self.assertEqual(cadllm.next_block_length([0.0, 0.0], 256, he), 12)
+        self.assertEqual(cadllm.next_block_steps([], 40, he), 16)
+        # conf 0.5 -> 16 + int(16 * 0.5) = 24, scaled by 48/48
+        self.assertEqual(cadllm.next_block_steps([0.5, 0.5], 48, he), 24)
+        for task in ("gsm8k", "math", "mbpp", None):
+            self.assertIs(cadllm.settings_for(task), cadllm.DEFAULT_SETTINGS)
+
     def test_threshold_sawtooth(self):
         self.assertAlmostEqual(cadllm.block_threshold(0, 24), 0.85)
         self.assertAlmostEqual(cadllm.block_threshold(12, 24), 0.625)

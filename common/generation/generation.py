@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from common.generation.cadllm import cadllm_loop
+from common.generation.cadllm import settings_for as cadllm_settings_for
 from common.generation.sampling import bernoulli_sample
 from common.generation.sampling import categorical_sample
 from common.generation.sampling import dpls_greedy
@@ -102,6 +103,7 @@ def generate_unified(
     block_sampling_mode: str = "categorical",
     block_unmask_fixed_schedule: tuple[int, ...] | None = None,
     block_unmask_cond_block: int | None = None,
+    cadllm_task: str | None = None,
 ) -> GenerationResult:
     if record_probe_data and adaptive_block:
         # Only the fixed-block loop has the recording hook; the adaptive and
@@ -657,6 +659,7 @@ def generate_unified(
             _gen_logits,
             steps_taken,
             _record_order if record_unmask_order else None,
+            settings=cadllm_settings_for(cadllm_task),
         )
     elif not adaptive_block:
         for num_block in range(num_blocks):

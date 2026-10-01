@@ -4,7 +4,8 @@ Source: github.com/juchengshen/CadLLM, llada/cadllm_generate.py:generate_cadllm,
 the settings of its llada/eval_gsm8k.sh and eval_math.sh (identical for both tasks):
 initial_block_length 24, initial_steps 24, max_steps 90, block size in [4, 64],
 softmax confidence, adaptive block / steps / vocab / threshold all on, factor and
-prophet off, temperature 0.
+prophet off, temperature 0. HumanEval gets its own schedule (SETTINGS below);
+MBPP uses the default one.
 
 We follow the released CODE where it disagrees with the paper:
 - the threshold is a within-block sawtooth, max(0.85 - 0.45 * i / S_t, 0.4) with i the
@@ -22,18 +23,40 @@ step (no cache), same as every other method in this harness. The decoding rule i
 unchanged; only the cache approximation is gone, and NFE counts the same forwards.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-INITIAL_BLOCK_LENGTH = 24
-INITIAL_STEPS = 24
-MAX_STEPS = 90
-MAX_BLOCK = 64
-MIN_BLOCK = 4
 INITIAL_THRESHOLD = 0.85
 MIN_THRESHOLD = 0.4
 REPETITION_WINDOW = 50  # recently committed tokens kept for repetition detection
+
+
+@dataclass(frozen=True)
+class CadLLMSettings:
+    initial_block_length: int = 24
+    initial_steps: int = 24
+    max_steps: int = 90
+    max_block: int = 64
+    min_block: int = 4
+
+
+# Paper Table 4 = eval_gsm8k.sh / eval_math.sh. MBPP stays here too: eval_mbpp.sh means
+# the same values but spells initial_steps as `base_steps`, which eval_llada.py swallows
+# in **kwargs (leaving its initial_steps=128 default); we take the intended Table 4 value.
+DEFAULT_SETTINGS = CadLLMSettings()
+# eval_humaneval.sh, identical to the LLaDA HEval column of the paper's Table 12.
+SETTINGS = {
+    "humaneval": CadLLMSettings(
+        initial_block_length=48, initial_steps=16, max_steps=32, max_block=96, min_block=12
+    ),
+}
+
+
+def settings_for(dataset_name):
+    return SETTINGS.get(dataset_name, DEFAULT_SETTINGS)
 
 
 def detect_repetition(generated_tokens, window_size=8, min_repeat_length=2):
@@ -127,26 +150,28 @@ def _recent_confidence(confidence_history):
     return torch.tensor(confidence_history[-2:]).mean().item()
 
 
-def next_block_length(confidence_history, remaining):
+def next_block_length(confidence_history, remaining, s=DEFAULT_SETTINGS):
     """calculate_adaptive_block_size with adaptive_blocks=True."""
     if confidence_history:
-        block_length = MIN_BLOCK + int(
-            (MAX_BLOCK - MIN_BLOCK) * _recent_confidence(confidence_history)
+        block_length = s.min_block + int(
+            (s.max_block - s.min_block) * _recent_confidence(confidence_history)
         )
     else:
-        block_length = INITIAL_BLOCK_LENGTH
-    block_length = max(MIN_BLOCK, min(block_length, MAX_BLOCK))
+        block_length = s.initial_block_length
+    block_length = max(s.min_block, min(block_length, s.max_block))
     return min(block_length, remaining)
 
 
-def next_block_steps(confidence_history, block_length):
+def next_block_steps(confidence_history, block_length, s=DEFAULT_SETTINGS):
     """calculate_adaptive_step with adaptive_steps=True."""
     if not confidence_history:
-        return INITIAL_STEPS
+        return s.initial_steps
     avg_confidence = max(0.0, min(1.0, float(_recent_confidence(confidence_history))))
-    steps_for_conf = INITIAL_STEPS + int((MAX_STEPS - INITIAL_STEPS) * (1.0 - avg_confidence))
-    steps_for_conf = max(INITIAL_STEPS, min(steps_for_conf, MAX_STEPS))
-    return max(1, int(steps_for_conf * block_length / INITIAL_BLOCK_LENGTH))
+    steps_for_conf = s.initial_steps + int(
+        (s.max_steps - s.initial_steps) * (1.0 - avg_confidence)
+    )
+    steps_for_conf = max(s.initial_steps, min(steps_for_conf, s.max_steps))
+    return max(1, int(steps_for_conf * block_length / s.initial_block_length))
 
 
 def threshold_commit(confidence, mask, threshold):
@@ -162,7 +187,10 @@ def threshold_commit(confidence, mask, threshold):
     return commit
 
 
-def cadllm_loop(x, prompt_L, L, mask_id, gen_logits, steps_taken, record_order=None):
+def cadllm_loop(
+    x, prompt_L, L, mask_id, gen_logits, steps_taken, record_order=None,
+    settings=DEFAULT_SETTINGS,
+):
     """Decode x[:, prompt_L:] in place with CadLLM's rule. Batch size 1 only.
 
     :param gen_logits: callable returning (1, L, V) logits over the generation region
@@ -170,6 +198,7 @@ def cadllm_loop(x, prompt_L, L, mask_id, gen_logits, steps_taken, record_order=N
     :param steps_taken: (1,) int counter, incremented once per forward (NFE)
     :param record_order: optional callback taking the (1, L) bool commit mask, called
         before steps_taken is incremented
+    :param settings: CadLLMSettings, the released per-task schedule (settings_for)
     :return: list of the block lengths used, in order
     """
     confidence_history = []
@@ -178,8 +207,8 @@ def cadllm_loop(x, prompt_L, L, mask_id, gen_logits, steps_taken, record_order=N
     pos = 0
     while pos < L:
         progress = pos / L
-        block_length = next_block_length(confidence_history, L - pos)
-        block_steps = next_block_steps(confidence_history, block_length)
+        block_length = next_block_length(confidence_history, L - pos, settings)
+        block_steps = next_block_steps(confidence_history, block_length, settings)
         end = pos + block_length
         region = slice(prompt_L + pos, prompt_L + end)
 

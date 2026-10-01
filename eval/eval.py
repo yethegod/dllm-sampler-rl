@@ -256,6 +256,9 @@ def evaluate(
                 )
             elif remasking == "fastdllm":
                 gen_kwargs["thres"] = thres
+            elif remasking == "cadllm":
+                # CadLLM's released scripts tune its schedule per task (HumanEval differs).
+                gen_kwargs["cadllm_task"] = dataset_name
             elif remasking != "block_schedule":
                 gen_kwargs["steps"] = steps
 

@@ -5,6 +5,7 @@
 # Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
 import numpy as np
 import torch
+from datasets import load_dataset
 from datasets import load_from_disk
 
 from data.loaders.gsm8k import DATASETS_PATH
@@ -35,7 +36,12 @@ class HumanEvalDataset(torch.utils.data.Dataset):
         return len(self.subsample)
 
     def load_test_dataset(self):
-        self.dataset = load_from_disk(f"{DATASETS_PATH}/humaneval")["test"]
+        local_path = DATASETS_PATH / "humaneval"
+        if local_path.exists():
+            self.dataset = load_from_disk(str(local_path))["test"]
+        else:
+            # The same 164 problems with the prompt / test / entry_point fields used here.
+            self.dataset = load_dataset("openai/openai_humaneval")["test"]
 
     def create_prompt(self, prompt_text):
         # HumanEval is 0-shot (no few-shot examples)
