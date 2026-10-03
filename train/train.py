@@ -235,6 +235,25 @@ def main(grpo_config, model_config):
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
+    if grpo_config.drop_long_prompts:
+        # Same text the trainer tokenizes: chat template, then gen_prefix for KodCode.
+        def _prompt_len(x):
+            text = tokenizer.apply_chat_template(
+                x["prompt"], tokenize=False, add_generation_prompt=True
+            )
+            if x["dataset_type"] == "kodcode":
+                text += x["gen_prefix"]
+            return len(tokenizer(text, add_special_tokens=False).input_ids)
+
+        n_before = len(train_set)
+        train_set = train_set.filter(
+            lambda x: _prompt_len(x) <= grpo_config.max_prompt_length
+        )
+        print(
+            f"drop_long_prompts: kept {len(train_set)}/{n_before} prompts "
+            f"<= {grpo_config.max_prompt_length} tokens"
+        )
+
     # Create policy based on type
     if grpo_config.policy_type == "dit_hidden":
         assert grpo_config.model_type == "LLaDA", (

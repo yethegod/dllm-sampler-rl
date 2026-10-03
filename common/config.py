@@ -280,6 +280,17 @@ class Config(GRPOConfig):
         },
     )
 
+    drop_long_prompts: bool = field(
+        default=False,
+        metadata={
+            "help": "Drop training prompts longer than max_prompt_length tokens (chat "
+            "template + KodCode gen_prefix) instead of letting the trainer left-truncate "
+            "them, which cuts the problem statement's head. Off by default so existing "
+            "runs keep their data order. KodCode-Light-RL-10K: 51% exceed 200 tokens, "
+            "15% exceed 512."
+        },
+    )
+
     thres: float = field(
         default=0.9,
         metadata={
