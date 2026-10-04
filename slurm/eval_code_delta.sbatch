@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180g
 #SBATCH --time=04:00:00
-#SBATCH --array=1,4
+#SBATCH --array=4
 #SBATCH --job-name=eval-code-delta
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -22,18 +22,15 @@
 #   3  CadLLM, per-task settings
 #   4  a1 DPLS trained on KodCode only, last checkpoint, same greedy modes as 0
 #
-# Greedy decodes differ between A100 and GH200 (MATH500 35.4 vs 34.0), so the GH200
-# numbers in eval_results/code are NOT the bar for an A100 run. Default array = 4 plus
-# its bar (1) on the same hardware; add 0/2/3 for the full table on A100. Results go
-# to eval_results/code_a100, never into the GH200 dir: eval.pipeline does not skip
-# finished runs and the DeltaAI task-4 job writes code/a1_dpls_kodcode.
+# Default array = 4 only (KodCode). Writes the same eval_results/code as the DeltaAI
+# script, so do not let this and the DeltaAI task-4 job run at the same time.
 # 4h limit: a GH200 task took 20-27 min on 2 GPUs; A100 is slower.
 
 set -euo pipefail
 
 REPO=/u/zsun9/dllm-sampler-rl
 WORK=/work/hdd/bhta/zsun9
-RESULTS=${RESULTS:-$WORK/eval_results/code_a100}
+RESULTS=${RESULTS:-$WORK/eval_results/code}
 CKPT_DIR=$WORK/checkpoints/llada8b_block_unmask_cond_v2_a1_dpls
 POLICY_CONFIG=configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha1_dpls.yaml
 BASE_CONFIG=configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_mixture.yaml
