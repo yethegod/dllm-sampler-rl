@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.generation.generation import generate_unified  # noqa: E402
 from common.models.policy import DiTConfidencePolicy, PolicyHFWrapper  # noqa: E402
+from train.trainer import Trainer  # noqa: E402
 
 VOCAB = 40
 MASK_ID = VOCAB - 1
@@ -149,6 +150,47 @@ class TestPolicyLoopDpls(unittest.TestCase):
     def test_unknown_mode_fails_up_front(self):
         with self.assertRaises(ValueError):
             _run(self.policy, "categorical")
+
+
+class TestTrainerDplsEntropy(unittest.TestCase):
+    def test_steps_without_candidates_keep_entropy_finite(self):
+        # The 2-GPU smoke (job 3314851) logged entropy nan: steps where a row had
+        # already filled its block have an all-False mask, and softmax over all -inf
+        # is NaN, which survives the multiply by a zero active mask.
+        torch.manual_seed(0)
+        B, T, n = 2, 3, 6
+        logits = torch.randn(B, T, n)
+        masks = torch.rand(B, T, n) < 0.6
+        masks[0, 2] = False  # row 0 done with its block at the last step
+        masks[1, 1] = False
+        masks[:, 0, 0] = True  # at least one active step
+        samples = torch.full((B, T, n), -1, dtype=torch.long)
+        for b in range(B):
+            for t in range(T):
+                idx = masks[b, t].nonzero().flatten()
+                if len(idx):
+                    samples[b, t, 0] = idx[0]
+        args = SimpleNamespace(
+            fp16=False,
+            remasking="policy",
+            sampling_mode="dpls",
+            dpls_stop_logit=0.0,
+            loglikelihood_dtype=torch.float32,
+            block_unmask_split_loss=False,
+        )
+        stub = SimpleNamespace(args=args)
+        lls, ent = Trainer._get_per_timestep_logps_block(
+            stub, lambda *_: logits, samples, masks, (None,), "dpls", return_entropy=True
+        )
+        self.assertTrue(bool(torch.isfinite(ent)), ent)
+        self.assertTrue(bool(torch.isfinite(lls).all()))
+        # The value is the mean first-choice entropy over the active steps only.
+        act = masks.any(-1)
+        ref = []
+        for b, t in act.nonzero().tolist():
+            p = torch.softmax(logits[b, t][masks[b, t]], -1)
+            ref.append(-(p * p.log()).sum())
+        self.assertAlmostEqual(float(ent), float(torch.stack(ref).mean()), places=5)
 
 
 if __name__ == "__main__":

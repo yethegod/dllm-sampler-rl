@@ -840,12 +840,20 @@ class Trainer(GRPOTrainer):
                 active_mask = sampling_masks.float()
                 entropy = (entropy * active_mask).sum() / active_mask.sum()
             elif sampling_mode == "dpls":
-                masked_logits = logits.masked_fill(~sampling_masks, float("-inf"))
+                # A step with no candidates (row already done with its block, or a
+                # padded timestep) would softmax an all -inf row into NaN, and NaN * 0
+                # stays NaN; give those rows finite logits, active_mask drops them.
+                active_mask = sampling_masks.any(dim=-1)
+                masked_logits = torch.where(
+                    active_mask.unsqueeze(-1),
+                    logits.float().masked_fill(~sampling_masks, float("-inf")),
+                    torch.zeros_like(logits, dtype=torch.float32),
+                )
                 probs = torch.softmax(masked_logits, dim=-1)
                 probs_clamped = probs.clamp(1e-8, 1.0)
                 entropy = -(probs * torch.log(probs_clamped)).sum(dim=-1)
-                active_mask = sampling_masks.any(dim=-1).float()
-                entropy = (entropy * active_mask).sum() / active_mask.sum()
+                active_mask = active_mask.float()
+                entropy = (entropy * active_mask).sum() / active_mask.sum().clamp(min=1)
 
         del logits
         torch.cuda.empty_cache()
