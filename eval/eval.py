@@ -144,6 +144,11 @@ def parse_baseline_checkpoint(name):
     if match := re.search(r"t([\d.]+)", name):
         params["thres"] = float(match.group(1))
 
+    # Extract s<signed number> (Fast-dLLM threshold slope over answer positions; the
+    # t<number> above is then the schedule's mean, see generation.position_threshold)
+    if match := re.search(r"-s(-?[\d.]+)(?=-|$)", name):
+        params["thres_slope"] = float(match.group(1))
+
     # Extract ada<number> (adaptive block, AdaBlock delimiter threshold)
     if match := re.search(r"ada([\d.]+)", name):
         params["adaptive_block"] = True
@@ -165,6 +170,7 @@ def evaluate(
     block_length=32,
     remasking="low_confidence",
     thres=0.7,
+    thres_slope=0.0,
     sampling_mode="bernoulli",
     dpls_stop_logit=0.0,
     temperature_policy=1.0,
@@ -256,6 +262,7 @@ def evaluate(
                 )
             elif remasking == "fastdllm":
                 gen_kwargs["thres"] = thres
+                gen_kwargs["thres_slope"] = thres_slope
             elif remasking == "cadllm":
                 # CadLLM's released scripts tune its schedule per task (HumanEval differs).
                 gen_kwargs["cadllm_task"] = dataset_name
@@ -618,6 +625,13 @@ if __name__ == "__main__":
     parser.add_argument("--remasking", type=str, default="policy")
     parser.add_argument("--policy_path", type=str, default=None)
     parser.add_argument("--thres", type=float, default=0.7)
+    parser.add_argument(
+        "--thres_slope",
+        type=float,
+        default=0.0,
+        help="fastdllm only: rise of a linear threshold from the first to the last answer "
+        "position, --thres being its mean (baseline name suffix -s<slope>)",
+    )
     parser.add_argument("--n_test", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -769,6 +783,8 @@ if __name__ == "__main__":
         args.remasking = baseline_params["method"]
         if "thres" in baseline_params:
             args.thres = baseline_params["thres"]
+        if "thres_slope" in baseline_params:
+            args.thres_slope = baseline_params["thres_slope"]
         if "diffusion_steps" in baseline_params:
             args.diffusion_steps = baseline_params["diffusion_steps"]
         if baseline_params.get("adaptive_block"):
@@ -1001,6 +1017,7 @@ if __name__ == "__main__":
         steps=args.diffusion_steps,
         remasking=args.remasking,
         thres=args.thres,
+        thres_slope=args.thres_slope,
         sampling_mode=args.sampling_mode,
         dpls_stop_logit=args.dpls_stop_logit,
         temperature_policy=args.temperature_policy,
@@ -1084,6 +1101,7 @@ if __name__ == "__main__":
                 if args.remasking
                 in ("block_policy", "block_schedule", "block_unmask_policy", "cadllm")
                 else args.thres,
+                "thres_slope": args.thres_slope if args.remasking == "fastdllm" else None,
                 "block_sampling_mode": args.block_sampling_mode
                 if args.remasking == "block_unmask_policy"
                 else None,

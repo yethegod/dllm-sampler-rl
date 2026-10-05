@@ -79,6 +79,7 @@ def generate_unified(
     remasking: str,
     policy=None,
     thres: float | torch.Tensor | None = None,
+    thres_slope: float = 0.0,
     steps: int | None = None,
     gen_length: int = 128,
     block_length: int = 32,
@@ -185,6 +186,13 @@ def generate_unified(
     elif remasking == "fastdllm":
         if thres is None:
             raise ValueError("thres must be provided for remasking='fastdllm'")
+        if thres_slope != 0.0:
+            # Position-dependent threshold distilled from the learned unmask head, whose
+            # STOP crossing rises along the answer: thres is the mean over the answer
+            # and thres_slope the rise from its first to its last position.
+            if isinstance(thres, torch.Tensor) and thres.numel() != 1:
+                raise ValueError("thres_slope needs a scalar thres (the schedule's mean)")
+            thres = position_threshold(float(thres), thres_slope, gen_length, prompt.device)
     elif remasking == "cadllm":
         # Eval-only baseline with its own block / threshold schedule; see cadllm.py.
         if prompt.shape[0] != 1:
@@ -196,6 +204,8 @@ def generate_unified(
             raise ValueError(f"steps must be provided for remasking='{remasking}'")
     else:
         raise ValueError(f"Unknown remasking strategy: {remasking}")
+    if thres_slope != 0.0 and remasking != "fastdllm":
+        raise ValueError(f"thres_slope only applies to remasking='fastdllm', got {remasking!r}")
 
     if adaptive_block:
         if remasking not in ["policy", "fastdllm"]:
@@ -1044,10 +1054,25 @@ def _policy_unmask_decisions(
     return unmask, sampling_data
 
 
+def position_threshold(
+    mean: float, slope: float, L: int, device: torch.device | None = None
+) -> torch.Tensor:
+    """Linear Fast-dLLM threshold over answer positions, as a (1, L) tensor.
+
+    tau(i) = mean + slope * ((i + 0.5) / L - 0.5), clamped to [0, 1]: `mean` is its
+    average over the answer and `slope` its rise from the first to the last position,
+    so slope 0 is plain Fast-dLLM at `mean`. A position whose tau is 1 is only ever
+    committed by the one-token fallback.
+    """
+    pos = (torch.arange(L, dtype=torch.float32, device=device) + 0.5) / L - 0.5
+    return (mean + slope * pos).clamp(0.0, 1.0).unsqueeze(0)
+
+
 def _normalize_row_threshold(
     thres: float | torch.Tensor,
     B: int,
     device: torch.device,
+    L: int | None = None,
 ) -> torch.Tensor:
     """Coerce a Fast-dLLM threshold into a (row, position)-broadcastable tensor.
 
@@ -1056,7 +1081,10 @@ def _normalize_row_threshold(
 
     - a Python (or NumPy) scalar, or a 0-D tensor -- the same threshold for every row;
     - a (B, 1) tensor -- one threshold per row, what expert steering passes;
-    - a (1, 1) tensor -- a scalar with the batch axis spelled out.
+    - a (1, 1) tensor -- a scalar with the batch axis spelled out;
+    - a (1, L) tensor -- one threshold per answer position, shared by every row
+      (position_threshold), accepted only when the caller passes L, the width it will
+      be compared against. (B, L) stays rejected: nothing produces per-row schedules.
 
     A (B,) tensor is rejected on purpose: torch broadcasts it along the *position* axis,
     comparing row r's threshold against position r of every row. That is silently wrong,
@@ -1067,7 +1095,9 @@ def _normalize_row_threshold(
     :param device: device to place the returned threshold on; a tensor threshold that
         arrived on another device (a CPU threshold against CUDA probabilities) is moved
         here, keeping its dtype and shape
-    :return: a tensor of shape (B, 1) or (1, 1), on `device`
+    :param L: number of positions the threshold is compared against, if a
+        per-position threshold is allowed
+    :return: a tensor of shape (B, 1), (1, 1) or (1, L), on `device`
     """
     if not isinstance(thres, torch.Tensor):
         return torch.as_tensor(
@@ -1077,6 +1107,8 @@ def _normalize_row_threshold(
     if thres.dim() == 0:
         return thres.reshape(1, 1).to(device)
     if thres.dim() == 2 and thres.shape[1] == 1 and thres.shape[0] in (1, B):
+        return thres.to(device)
+    if L is not None and thres.dim() == 2 and thres.shape == (1, L):
         return thres.to(device)
 
     raise ValueError(
@@ -1139,10 +1171,11 @@ def _confidence_threshold_unmask_rowwise(
 
     :param block_mask_index: (B, L) still-masked positions inside each row's own block
     :param probs: (B, L, V) next-token probabilities
-    :param thres: confidence threshold; scalar, 0-D tensor, or (B, 1) per-row
+    :param thres: confidence threshold; scalar, 0-D tensor, (B, 1) per-row, or (1, L)
+        per-position
     :return: (B, L) boolean mask of positions to unmask
     """
-    row_thres = _normalize_row_threshold(thres, probs.shape[0], probs.device)
+    row_thres = _normalize_row_threshold(thres, probs.shape[0], probs.device, probs.shape[1])
 
     confidence = probs.max(dim=-1).values  # (B, L)
     confidence = confidence.masked_fill(~block_mask_index, -torch.inf)
