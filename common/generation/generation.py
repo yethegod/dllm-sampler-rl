@@ -120,6 +120,11 @@ def generate_unified(
     if remasking == "policy":
         if policy is None:
             raise ValueError("policy must be provided for remasking='policy'")
+        if sampling_mode not in ("bernoulli", "bernoulli-argmax", "dpls", "dpls-greedy"):
+            raise ValueError(
+                "remasking='policy' supports sampling_mode 'bernoulli', "
+                f"'bernoulli-argmax', 'dpls' or 'dpls-greedy', got {sampling_mode!r}"
+            )
     elif remasking in ("block_policy", "block_schedule"):
         if remasking == "block_policy":
             if policy is None:
@@ -1002,6 +1007,14 @@ def _policy_unmask_decisions(
         samples_for_loglik = b
     elif sampling_mode == "dpls":
         dpls_sequences, b = dpls_sample(
+            utilities=policy_logits,
+            stop_logit=dpls_stop_logit,
+            mask_index=sampling_mask,
+        )
+        samples_for_loglik = dpls_sequences
+    elif sampling_mode == "dpls-greedy":
+        # Deterministic eval counterpart of 'dpls' (see sampling.dpls_greedy).
+        dpls_sequences, b = dpls_greedy(
             utilities=policy_logits,
             stop_logit=dpls_stop_logit,
             mask_index=sampling_mask,

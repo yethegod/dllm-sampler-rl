@@ -1,0 +1,103 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Ablation control for the joint block_unmask policy: the paper's fixed-block
+# unmasking policy (remasking=policy, dit_confidence) at b=32, trained with the
+# same sampler, reward and data as
+# llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha1_dpls.yaml:
+#   DPLS (stop logit 0), alpha=1, gsm8k_and_math, seed 123, lr 3e-5, num_generations 8,
+#   num_iterations 2, one epoch (1870 steps).
+# What is removed is the block head and the window conditioning: the unmask head never
+# sees a block size other than 32 and is never told which window it decodes.
+#
+# WHY. Ablation grid (unmask head x block rule) at inference:
+#   this policy + fixed b=32 / + AdaBlock B0=32 / + the joint run's learned block head,
+#   against the joint policy itself. This head is the "unconditioned" row.
+# Unlike llada_8b_instruct_dit_confidence_BL32_mixture.yaml (the BL32 reproduction:
+# Bernoulli, alpha unset = 0) it differs from the joint run only in the block decision.
+#
+# The fixed-block loop gives each block at most 32 forwards and breaks as soon as every
+# row has filled it; DPLS commits >= 1 position per forward, so a block always finishes
+# and nothing is left masked. Eval with --sampling_mode dpls-greedy (deterministic).
+#
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+block_length: 32
+generation_batch_size: 128
+remasking: policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# Reward = 1{correct} * ((L - min(N, L) + 1) / L)^alpha, as in the joint a1 run.
+alpha_compute_reward: 1.0
+
+# Policy specific (the joint run's unmask head minus block head and window embedding)
+policy_type: dit_confidence
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -2.0
+sampling_mode: dpls
+dpls_stop_logit: 0.0
