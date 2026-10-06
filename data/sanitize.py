@@ -182,20 +182,24 @@ def sanitize_mbpp(completion: str) -> str:
 
     Note: With gen_prefix "\n```python\n", the opening markdown fence is in the input,
     so the generation may only contain code + closing ```.
+
+    Same fence rule as sanitize_humaneval: if the first fence is a closing ```, the
+    answer is everything before it. Checking for ```python first would instead pick a
+    later block, e.g. the asserts a model often appends after its answer, and the
+    function itself would be dropped.
     """
-    # Extract code from markdown code blocks if present
-    if "```python" in completion:
-        # Extract content between ```python and closing ```
-        start = completion.find("```python") + len("```python")
+    first_py = completion.find("```python")
+    first_any = completion.find("```")
+
+    if first_any != -1 and (first_py == -1 or first_any < first_py):
+        # Opening fence was in the gen_prefix; keep content up to the closing fence
+        completion = completion[:first_any]
+    elif first_py != -1:
+        # Extract the first python fenced block
+        start = first_py + len("```python")
         end = completion.find("```", start)
         if end != -1:
             completion = completion[start:end]
-    elif "```" in completion:
-        # If only closing ``` is present, extract everything before it
-        # (the opening ```python was part of the input gen_prefix)
-        end = completion.find("```")
-        if end != -1:
-            completion = completion[:end]
 
     try:
         return sanitize(completion, entrypoint=None)
