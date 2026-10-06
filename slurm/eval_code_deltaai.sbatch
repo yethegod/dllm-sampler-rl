@@ -21,6 +21,7 @@
 #   3  CadLLM, per-task settings from its released eval_humaneval.sh / eval_mbpp.sh
 #   4  a1 DPLS trained on KodCode only (in-domain), last checkpoint, same greedy modes as 0
 #      (not in the default array: sbatch --array=4 ...)
+#   5  same as 4 for the alpha=0.5 KodCode run (sbatch --array=5 ...)
 #
 # GH200 only (greedy decodes differ between A100 and GH200). All four are
 # deterministic, so seed 42 only. Each task fits the 2h ghx4-interactive cap: run as
@@ -71,6 +72,12 @@ case "$TASK" in
        --remasking block_unmask_policy --sampling_mode dpls-greedy \
        --block_sampling_mode categorical-argmax \
        --save_path "$RESULTS/a1_dpls_kodcode" --no_aggregate "${EXTRA[@]}" ;;
+  5) python -m eval.pipeline "$WORK/checkpoints/llada8b_block_unmask_cond_v2_a0p5_dpls_kodcode" \
+       configs/experiment_configs/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha0p5_dpls_kodcode.yaml \
+       --checkpoints last --datasets "$DATASETS" --seeds 42 --temperatures 1.0 \
+       --remasking block_unmask_policy --sampling_mode dpls-greedy \
+       --block_sampling_mode categorical-argmax \
+       --save_path "$RESULTS/a0p5_dpls_kodcode" --no_aggregate "${EXTRA[@]}" ;;
   1) base baseline-fastdllm-t0.9 fixed/t0.9_bl32 --block_length 32 ;;
   2) base baseline-fastdllm-t0.9 ada --block_length 32 --adaptive_block --delimiter_threshold 0.3 ;;
   3) base baseline-cadllm cadllm ;;
