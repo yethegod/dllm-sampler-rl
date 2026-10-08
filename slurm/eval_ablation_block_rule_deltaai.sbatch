@@ -22,7 +22,8 @@
 # (--unmask_policy_path). F8/F16/F64/F128 sweep the fixed head's block size (remasking=policy,
 # so b must divide gen_length 256; b=96 is not run).
 # One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
-#   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math}
+#   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math};
+#   or a comma-separated list, e.g. LANE=F32:gsm8k,FADA:gsm8k (finished cells are skipped)
 #   LANE=SMOKE  n_test 4 of every new path, plus an exactness check: FLRN with the
 #               block forced to 32 must equal F32.
 # Run serially by slurm/logs/ablation_block_rule_chain.sh (interactive QoS = 1 job).
@@ -106,6 +107,13 @@ print("exactness F32 vs FLRN-forced-32:", same)
 sys.exit(0 if len(a) == len(b) == 4 and all(same) else 1)
 EOF
 else
-  run_cell "${LANE%%:*}" "${LANE##*:}"
+  # LANE may list several cells, comma-separated, to share one interactive allocation.
+  # A finished cell leaves a marker and is skipped on a rerun after a timeout.
+  for one in ${LANE//,/ }; do
+    marker="$RESULTS/.done_${one/:/_}"
+    if [ -f "$marker" ]; then echo "=== $one already done, skip"; continue; fi
+    run_cell "${one%%:*}" "${one##*:}"
+    touch "$marker"
+  done
 fi
 echo "=== lane $LANE done $(date)"
