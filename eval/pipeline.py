@@ -38,6 +38,8 @@ class EvalConfig:
     block_sampling_mode: str | None = None
     block_unmask_fixed_schedule: str | None = None
     block_unmask_cond_block: int | None = None
+    unmask_policy_path: str | None = None
+    unmask_policy_config: str | None = None
     record_unmask_order: bool = False
     record_policy_trace: bool = False
 
@@ -184,6 +186,11 @@ def run_eval(
                 output_dir = Path(f"{output_dir}_fixed{tag}")
             if cfg.block_unmask_cond_block is not None:
                 output_dir = Path(f"{output_dir}_cond{cfg.block_unmask_cond_block}")
+            if cfg.unmask_policy_path:
+                # Name the swapped-in unmask head by its run and checkpoint.
+                upol = Path(cfg.unmask_policy_path).parent
+                ckpt_tag = upol.name.replace("checkpoint-", "ckpt")
+                output_dir = Path(f"{output_dir}_unmaskpol-{upol.parent.name}-{ckpt_tag}")
             # A traced run is usually an --n_test slice: never let it overwrite the
             # full run's generations.
             if cfg.record_policy_trace:
@@ -245,6 +252,15 @@ def run_eval(
             )
         if cfg.block_unmask_cond_block is not None:
             cmd.extend(["--block_unmask_cond_block", str(cfg.block_unmask_cond_block)])
+        if cfg.unmask_policy_path:
+            cmd.extend(
+                [
+                    "--unmask_policy_path",
+                    cfg.unmask_policy_path,
+                    "--unmask_policy_config",
+                    cfg.unmask_policy_config,
+                ]
+            )
         if cfg.record_unmask_order:
             cmd.append("--record_unmask_order")
         if cfg.record_policy_trace:
@@ -381,6 +397,17 @@ def main():
         "unmask head is told, independent of the real block.",
     )
     parser.add_argument(
+        "--unmask_policy_path",
+        default=None,
+        help="For --remasking block_unmask_policy: model.safetensors of a dit_confidence "
+        "policy that unmasks inside the blocks the main policy picks.",
+    )
+    parser.add_argument(
+        "--unmask_policy_config",
+        default=None,
+        help="Experiment config of the --unmask_policy_path policy.",
+    )
+    parser.add_argument(
         "--record_unmask_order",
         action="store_true",
         help="Store per-position unmask step indices in the generations JSON.",
@@ -394,6 +421,10 @@ def main():
     args = parser.parse_args()
     if args.remasking == "block_schedule" and not args.block_schedule:
         parser.error("--remasking block_schedule requires --block_schedule")
+    if (args.unmask_policy_path is None) != (args.unmask_policy_config is None):
+        parser.error("--unmask_policy_path and --unmask_policy_config go together")
+    if args.unmask_policy_path and args.remasking != "block_unmask_policy":
+        parser.error("--unmask_policy_path needs --remasking block_unmask_policy")
 
     run_paths = (
         args.run_paths.split(";")
@@ -430,6 +461,8 @@ def main():
             block_sampling_mode=args.block_sampling_mode,
             block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
             block_unmask_cond_block=args.block_unmask_cond_block,
+            unmask_policy_path=args.unmask_policy_path,
+            unmask_policy_config=args.unmask_policy_config,
             record_unmask_order=args.record_unmask_order,
             record_policy_trace=args.record_policy_trace,
         )

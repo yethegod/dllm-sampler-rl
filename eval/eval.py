@@ -120,6 +120,22 @@ def _block_unmask_traces(result, sampling_mode):
     return traces
 
 
+def _build_confidence_policy(config):
+    hidden_dim = config.policy_hidden_dim or 128
+    feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
+    return DiTConfidencePolicy(
+        hidden_dim=hidden_dim,
+        feedforward_dim=feedforward_dim,
+        num_heads=config.policy_num_heads,
+        dropout=config.policy_dropout,
+        time_embed_dim=config.policy_time_embed_dim,
+        smart_init=config.policy_smart_init,
+        confidences_top_p=config.confidences_top_p,
+        num_blocks=config.policy_num_blocks,
+        time_period=config.policy_time_period,
+    )
+
+
 def init_seed(seed):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -187,6 +203,7 @@ def evaluate(
     block_sampling_mode="categorical",
     block_unmask_fixed_schedule=None,
     block_unmask_cond_block=None,
+    unmask_policy=None,
     record_unmask_order=False,
     record_policy_trace=False,
 ):
@@ -289,6 +306,7 @@ def evaluate(
                         "block_sampling_mode": block_sampling_mode,
                         "block_unmask_fixed_schedule": block_unmask_fixed_schedule,
                         "block_unmask_cond_block": block_unmask_cond_block,
+                        "unmask_policy": unmask_policy,
                     }
                 )
             if record_unmask_order:
@@ -704,6 +722,22 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--unmask_policy_path",
+        type=str,
+        default=None,
+        help=(
+            "For --remasking block_unmask_policy: model.safetensors of a separately "
+            "trained dit_confidence policy that unmasks inside the blocks the main "
+            "policy's block head (or --adaptive_block) picks. Needs --unmask_policy_config."
+        ),
+    )
+    parser.add_argument(
+        "--unmask_policy_config",
+        type=str,
+        default=None,
+        help="Experiment config the --unmask_policy_path policy was trained with",
+    )
+    parser.add_argument(
         "--record_unmask_order",
         action="store_true",
         help="Store per-example (L,) unmask step indices in the generations JSON",
@@ -729,6 +763,10 @@ if __name__ == "__main__":
             "--block_unmask_fixed_schedule / --block_unmask_cond_block need "
             "--remasking block_unmask_policy"
         )
+    if (args.unmask_policy_path is None) != (args.unmask_policy_config is None):
+        parser.error("--unmask_policy_path and --unmask_policy_config go together")
+    if args.unmask_policy_path is not None and args.remasking != "block_unmask_policy":
+        parser.error("--unmask_policy_path needs --remasking block_unmask_policy")
     if args.block_schedule is not None:
         args.block_schedule = tuple(
             (int(b), float(t))
@@ -867,20 +905,7 @@ if __name__ == "__main__":
                 time_period=config.policy_time_period,
             ).to(device)
         elif config.policy_type == "dit_confidence":
-            hidden_dim = config.policy_hidden_dim or 128
-            feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
-
-            policy_core = DiTConfidencePolicy(
-                hidden_dim=hidden_dim,
-                feedforward_dim=feedforward_dim,
-                num_heads=config.policy_num_heads,
-                dropout=config.policy_dropout,
-                time_embed_dim=config.policy_time_embed_dim,
-                smart_init=config.policy_smart_init,
-                confidences_top_p=config.confidences_top_p,
-                num_blocks=config.policy_num_blocks,
-                time_period=config.policy_time_period,
-            ).to(device)
+            policy_core = _build_confidence_policy(config).to(device)
         elif config.policy_type == "dit_block_size":
             hidden_dim = config.policy_hidden_dim or 128
             feedforward_dim = config.policy_feedforward_dim or (4 * hidden_dim)
@@ -965,6 +990,32 @@ if __name__ == "__main__":
             state = load_file(args.policy_path)
             policy.load_state_dict(state)
 
+    # Ablation: a second, separately trained per-position policy that unmasks inside
+    # the main policy's blocks. Not prepared/wrapped: it only runs forward.
+    unmask_policy = None
+    if args.unmask_policy_path is not None:
+        (u_config,) = TrlParser((Config,)).parse_args_and_config(
+            args=["--config", args.unmask_policy_config], fail_with_unknown_args=False
+        )
+        if u_config.policy_type != "dit_confidence" or not u_config.policy_full_context:
+            raise ValueError(
+                "--unmask_policy_config must be a full-context dit_confidence policy, "
+                f"got {u_config.policy_type} full_context={u_config.policy_full_context}"
+            )
+        if u_config.confidences_top_p != args.grpo_config.confidences_top_p:
+            raise ValueError(
+                f"unmask policy reads top-{u_config.confidences_top_p} confidences, the "
+                f"main policy top-{args.grpo_config.confidences_top_p}"
+            )
+        # DPLS compares the unmask utilities against STOP, so the stop logit is the
+        # one the unmask policy was trained with.
+        args.dpls_stop_logit = u_config.dpls_stop_logit
+        unmask_policy = PolicyHFWrapper(_build_confidence_policy(u_config), "dit_confidence")
+        if accelerator.is_main_process:
+            print(f"Loading unmask policy from {args.unmask_policy_path}")
+        unmask_policy.load_state_dict(load_file(args.unmask_policy_path))
+        unmask_policy = unmask_policy.to(accelerator.device).eval()
+
     # Create the dataset
     dataset_kwargs = {
         "tokenizer": tokenizer,
@@ -1038,6 +1089,7 @@ if __name__ == "__main__":
         block_sampling_mode=args.block_sampling_mode,
         block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
         block_unmask_cond_block=args.block_unmask_cond_block,
+        unmask_policy=unmask_policy,
         record_unmask_order=args.record_unmask_order,
         record_policy_trace=args.record_policy_trace,
     )
@@ -1055,13 +1107,30 @@ if __name__ == "__main__":
         results["metrics"] = {
             k: results.pop(k) for k in ("wall_time", "total_processed")
         }
-        # Label adaptive-block runs distinctly so filenames and aggregation don't
-        # collide with fixed-block results (block_length only serves as the
-        # AdaBlock fallback length during generation, which is done by now).
-        # B0 stays in the label: it is only the fallback, but it bounds how far
-        # ahead a delimiter can move the boundary, so two runs differing only in
-        # B0 are different runs and must not group together during aggregation.
-        if args.adaptive_block:
+        if args.remasking == "block_unmask_policy":
+            # Block size and unmasking both come from the policy; no fixed length.
+            # The probe/ablation overrides go into the label too: aggregation groups
+            # on it, and a fixed-b, AdaBlock, lied-to or swapped-head run must never
+            # average with the learned one.
+            label = "blockunmask"
+            if args.adaptive_block:
+                label += f"_ada{args.delimiter_threshold}_B{args.block_length}"
+            if args.block_unmask_fixed_schedule is not None:
+                label += "_fixed" + "-".join(
+                    str(b) for b in args.block_unmask_fixed_schedule
+                )
+            if args.block_unmask_cond_block is not None:
+                label += f"_cond{args.block_unmask_cond_block}"
+            if args.unmask_policy_path is not None:
+                label += "_upol"
+            args.block_length = label
+        elif args.adaptive_block:
+            # Label adaptive-block runs distinctly so filenames and aggregation don't
+            # collide with fixed-block results (block_length only serves as the
+            # AdaBlock fallback length during generation, which is done by now).
+            # B0 stays in the label: it is only the fallback, but it bounds how far
+            # ahead a delimiter can move the boundary, so two runs differing only in
+            # B0 are different runs and must not group together during aggregation.
             args.block_length = f"ada{args.delimiter_threshold}_B{args.block_length}"
         elif args.remasking == "block_policy":
             # The policy picks a block length (and a threshold) per block, so no
@@ -1078,17 +1147,6 @@ if __name__ == "__main__":
         elif args.remasking == "cadllm":
             # CadLLM picks every block length itself; --block_length is unused.
             args.block_length = "cadllm"
-        elif args.remasking == "block_unmask_policy":
-            # Block size and unmasking both come from the policy; no fixed length.
-            # The probe overrides go into the label too: aggregation groups on it,
-            # and a fixed-b or lied-to run must never average with the learned one.
-            args.block_length = "blockunmask"
-            if args.block_unmask_fixed_schedule is not None:
-                args.block_length += "_fixed" + "-".join(
-                    str(b) for b in args.block_unmask_fixed_schedule
-                )
-            if args.block_unmask_cond_block is not None:
-                args.block_length += f"_cond{args.block_unmask_cond_block}"
         results.update(
             {
                 "model_path": args.model_path,
@@ -1109,6 +1167,7 @@ if __name__ == "__main__":
                 if args.block_unmask_fixed_schedule is not None
                 else None,
                 "block_unmask_cond_block": args.block_unmask_cond_block,
+                "unmask_policy_path": args.unmask_policy_path,
                 "n_test": args.n_test,
                 "few_shot": args.few_shot,
                 "adaptive_block": args.adaptive_block,

@@ -104,6 +104,7 @@ def generate_unified(
     block_sampling_mode: str = "categorical",
     block_unmask_fixed_schedule: tuple[int, ...] | None = None,
     block_unmask_cond_block: int | None = None,
+    unmask_policy=None,
     cadllm_task: str | None = None,
 ) -> GenerationResult:
     if record_probe_data and adaptive_block:
@@ -183,6 +184,26 @@ def generate_unified(
                 )
         if block_unmask_cond_block is not None and block_unmask_cond_block <= 0:
             raise ValueError("block_unmask_cond_block must be a positive block length")
+        if adaptive_block and block_unmask_fixed_schedule is not None:
+            raise ValueError(
+                "adaptive_block and block_unmask_fixed_schedule both replace the block "
+                "head; pass one"
+            )
+        # Ablation probe: a separately trained per-position policy decodes inside the
+        # blocks this policy's block head chose. Only the confidence policy, which
+        # reads exactly the (mask, top-p confidence, step/L) inputs this loop builds.
+        if unmask_policy is not None:
+            u_core = getattr(unmask_policy, "base_policy", unmask_policy)
+            u_type = getattr(unmask_policy, "policy_type", None)
+            if u_type != "dit_confidence":
+                raise ValueError(
+                    f"unmask_policy must be a dit_confidence policy, got {u_type!r}"
+                )
+            if u_core.confidences_top_p != confidences_top_p:
+                raise ValueError(
+                    f"unmask_policy reads top-{u_core.confidences_top_p} confidences, "
+                    f"the loop builds top-{confidences_top_p}"
+                )
     elif remasking == "fastdllm":
         if thres is None:
             raise ValueError("thres must be provided for remasking='fastdllm'")
@@ -206,9 +227,13 @@ def generate_unified(
         raise ValueError(f"Unknown remasking strategy: {remasking}")
     if thres_slope != 0.0 and remasking != "fastdllm":
         raise ValueError(f"thres_slope only applies to remasking='fastdllm', got {remasking!r}")
+    if unmask_policy is not None and remasking != "block_unmask_policy":
+        raise ValueError(
+            f"unmask_policy only applies to remasking='block_unmask_policy', got {remasking!r}"
+        )
 
     if adaptive_block:
-        if remasking not in ["policy", "fastdllm"]:
+        if remasking not in ["policy", "fastdllm", "block_unmask_policy"]:
             raise ValueError(
                 f"adaptive_block is not supported with remasking='{remasking}'"
             )
@@ -657,6 +682,11 @@ def generate_unified(
             fixed_schedule=block_unmask_fixed_schedule,
             cond_block=block_unmask_cond_block,
             dpls_stop_logit=dpls_stop_logit,
+            unmask_policy=unmask_policy,
+            # block_length is AdaBlock's fallback B0 here, as in the other loops.
+            adaptive_block_length=block_length if adaptive_block else None,
+            delimiter_ids=delimiter_ids,
+            delimiter_threshold=delimiter_threshold,
         )
     elif remasking == "cadllm":
         # Top-V confidences need the raw logits, so skip _forward_logits' full softmax.
@@ -1278,6 +1308,10 @@ def _block_unmask_policy_loop(
     fixed_schedule: tuple[int, ...] | None = None,
     cond_block: int | None = None,
     dpls_stop_logit: float = 0.0,
+    unmask_policy=None,
+    adaptive_block_length: int | None = None,
+    delimiter_ids: tuple[int, ...] = (198,),
+    delimiter_threshold: float = 0.3,
 ) -> dict:
     """Decode with a learned block size AND a learned per-position unmasking policy.
 
@@ -1309,6 +1343,16 @@ def _block_unmask_policy_loop(
     ``[block_start, block_start + cond_block)`` while the sampling mask keeps the real
     block: if the head's behaviour does not change with it, it never learned p(u|s,b).
     The recorded ``block_end`` is the window the head actually saw, as always.
+
+    Ablation swaps (eval-only, default off), one per axis of the (unmask head x
+    block rule) grid: ``adaptive_block_length=B0`` replaces the block head with
+    AdaBlock's delimiter rule (_compute_adaptive_block_length, B0 the fallback), read
+    off the same forward the block head would have used, so it costs no NFE. Its
+    lengths need not be candidates: ``block_sizes_chosen`` holds the real length and
+    the recorded block index is 0. ``unmask_policy`` replaces the unmask head with a
+    separately trained dit_confidence policy fed the same (mask, confidence, step/L)
+    it reads in its own full-context loop; it is never told the window. With a fixed
+    schedule of 32 that reproduces remasking='policy' at block_length 32 exactly.
 
     :return: dict of GenerationResult fields:
         sampling_inputs (B,T,L+K) = [unmask logits | block logits]
@@ -1368,28 +1412,44 @@ def _block_unmask_policy_loop(
         # the trainer masks out via the decision flag.
         needs = active & (block_start == block_end)
         b_idx = torch.zeros(B, dtype=torch.long, device=device)
+        b_len = torch.zeros(B, dtype=torch.long, device=device)
         block_logits = torch.zeros((B, K), dtype=torch.float32, device=device)
         if needs.any():
             block_logits = policy.block_logits(mask_index, c, per_batch_timestep, start_in)
             if temperature_policy != 1.0:
                 block_logits = block_logits / temperature_policy
             feasible = torch.isfinite(block_logits)
-            if fixed_schedule is not None:
-                want = sched_idx[n_decided.clamp(max=len(sched_idx) - 1)]  # (B,)
-                # Largest feasible candidate no bigger than the scheduled one; the
-                # smallest candidate always fits (gen_length tiling invariant).
-                ok = feasible & (
-                    torch.arange(K, device=device).unsqueeze(0) <= want.unsqueeze(-1)
-                )
-                drawn = (
-                    ok.long() * torch.arange(1, K + 1, device=device).unsqueeze(0)
-                ).argmax(dim=-1)
-            elif block_sampling_mode == "categorical-argmax":
-                drawn = block_logits.masked_fill(~feasible, float("-inf")).argmax(dim=-1)
+            if adaptive_block_length is not None:
+                for r in needs.nonzero(as_tuple=True)[0].tolist():
+                    b_len[r] = _compute_adaptive_block_length(
+                        x0[r : r + 1],
+                        probs[r : r + 1],
+                        int(block_start[r]),
+                        L,
+                        adaptive_block_length,
+                        delimiter_ids,
+                        delimiter_threshold,
+                    )
             else:
-                drawn = categorical_sample(block_logits, feasible)  # (B,)
-            b_idx = torch.where(needs, drawn, b_idx)
-            block_end = torch.where(needs, block_start + cand_b[b_idx], block_end)
+                if fixed_schedule is not None:
+                    want = sched_idx[n_decided.clamp(max=len(sched_idx) - 1)]  # (B,)
+                    # Largest feasible candidate no bigger than the scheduled one; the
+                    # smallest candidate always fits (gen_length tiling invariant).
+                    ok = feasible & (
+                        torch.arange(K, device=device).unsqueeze(0) <= want.unsqueeze(-1)
+                    )
+                    drawn = (
+                        ok.long() * torch.arange(1, K + 1, device=device).unsqueeze(0)
+                    ).argmax(dim=-1)
+                elif block_sampling_mode == "categorical-argmax":
+                    drawn = block_logits.masked_fill(~feasible, float("-inf")).argmax(
+                        dim=-1
+                    )
+                else:
+                    drawn = categorical_sample(block_logits, feasible)  # (B,)
+                b_idx = torch.where(needs, drawn, b_idx)
+                b_len = torch.where(needs, cand_b[b_idx], b_len)
+            block_end = torch.where(needs, block_start + b_len, block_end)
             n_decided = n_decided + needs.long()
 
         # The window the unmask head decodes in, fixed for this step. Recorded so the
@@ -1397,9 +1457,12 @@ def _block_unmask_policy_loop(
         end_in = block_end.unsqueeze(-1).clone()  # (B, 1)
         if cond_block is not None:
             end_in = (block_start + cond_block).clamp(max=L).unsqueeze(-1)
-        unmask_logits = policy.unmask_logits(
-            mask_index, c, per_batch_timestep, start_in, end_in
-        )
+        if unmask_policy is not None:
+            unmask_logits = unmask_policy(mask_index, c, per_batch_timestep)
+        else:
+            unmask_logits = policy.unmask_logits(
+                mask_index, c, per_batch_timestep, start_in, end_in
+            )
         if temperature_policy != 1.0:
             unmask_logits = unmask_logits / temperature_policy
 
@@ -1428,9 +1491,7 @@ def _block_unmask_policy_loop(
                     start_in,
                     end_in,
                 ),
-                "block_sizes_chosen": torch.where(
-                    needs, cand_b[b_idx], torch.zeros_like(b_idx)
-                ),
+                "block_sizes_chosen": torch.where(needs, b_len, torch.zeros_like(b_len)),
             }
         )
 
