@@ -21,8 +21,8 @@
 # FLRN runs the joint policy for block decisions and the fixed head for unmasking
 # (--unmask_policy_path). One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
 #   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math}
-#   LANE=SMOKE  n_test 4 of every new path on fixed-head ckpt FIX_CKPT (default 850),
-#               plus an exactness check: FLRN with the block forced to 32 must equal F32.
+#   LANE=SMOKE  n_test 4 of every new path, plus an exactness check: FLRN with the
+#               block forced to 32 must equal F32.
 # Run serially by slurm/logs/ablation_block_rule_chain.sh (interactive QoS = 1 job).
 
 set -euo pipefail
@@ -43,13 +43,11 @@ export OMP_NUM_THREADS=8
 export EVAL_MAIN_PROCESS_PORT=$((29500 + SLURM_JOB_ID % 400 * 5))
 cd "$REPO"
 
+FIX_CKPT=${FIX_CKPT:-$(ls -d "$FIX_RUN"/checkpoint-[0-9]* | sed 's/.*checkpoint-//' | sort -n | tail -1)}
+EXTRA=()
 if [ "$LANE" = SMOKE ]; then
-  FIX_CKPT=${FIX_CKPT:-850}
   RESULTS=$WORK/eval_results/ablation_block_rule_smoke
   EXTRA=(--n_test 4)
-else
-  FIX_CKPT=${FIX_CKPT:-$(ls -d "$FIX_RUN"/checkpoint-[0-9]* | sed 's/.*checkpoint-//' | sort -n | tail -1)}
-  EXTRA=()
 fi
 UPOL=$FIX_RUN/checkpoint-$FIX_CKPT/model.safetensors
 [ -f "$UPOL" ] || { echo "missing $UPOL"; exit 2; }
