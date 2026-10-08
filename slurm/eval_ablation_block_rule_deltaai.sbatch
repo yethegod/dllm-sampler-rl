@@ -19,7 +19,9 @@
 # joint a1 = llada8b_block_unmask_cond_v2_a1_dpls ckpt-1870; fixed head =
 # llada8b_bl32_a1_dpls (dit_confidence, DPLS, alpha=1), last checkpoint unless FIX_CKPT.
 # FLRN runs the joint policy for block decisions and the fixed head for unmasking
-# (--unmask_policy_path). One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
+# (--unmask_policy_path). F8/F16/F64/F128 sweep the fixed head's block size (remasking=policy,
+# so b must divide gen_length 256; b=96 is not run).
+# One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
 #   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math}
 #   LANE=SMOKE  n_test 4 of every new path, plus an exactness check: FLRN with the
 #               block forced to 32 must equal F32.
@@ -60,10 +62,10 @@ joint() {  # joint <dataset> <subdir> <extra pipeline args...>
     --block_sampling_mode categorical-argmax --datasets "$ds" --seeds 42 \
     --temperatures 1.0 --no_aggregate --save_path "$RESULTS/$sub" "$@" "${EXTRA[@]}"
 }
-fixed() {  # fixed <dataset> <subdir> <extra pipeline args...>
-  local ds=$1 sub=$2; shift 2
+fixed() {  # fixed <dataset> <subdir> <block_length> <extra pipeline args...>
+  local ds=$1 sub=$2 b=$3; shift 3
   python -m eval.pipeline "$FIX_RUN" "$FIX_CFG" --checkpoints "$FIX_CKPT" \
-    --remasking policy --sampling_mode dpls-greedy --block_length 32 --datasets "$ds" \
+    --remasking policy --sampling_mode dpls-greedy --block_length "$b" --datasets "$ds" \
     --seeds 42 --temperatures 1.0 --no_aggregate --save_path "$RESULTS/$sub" "$@" "${EXTRA[@]}"
 }
 ADA=(--adaptive_block --delimiter_threshold 0.3 --block_length 32)
@@ -73,8 +75,8 @@ run_cell() {  # run_cell <cell> <dataset>
   case "$1" in
     J32)  joint "$2" joint_b32 --block_unmask_fixed_schedule 32 ;;
     JADA) joint "$2" joint_ada "${ADA[@]}" ;;
-    F32)  fixed "$2" fixed_b32 ;;
-    FADA) fixed "$2" fixed_ada "${ADA[@]}" ;;
+    F8|F16|F32|F64|F128) fixed "$2" "fixed_b${1#F}" "${1#F}" ;;
+    FADA) fixed "$2" fixed_ada 32 "${ADA[@]}" ;;
     FLRN) joint "$2" fixed_learned "${UPOL_ARGS[@]}" ;;
     *) echo "unknown cell $1"; exit 2 ;;
   esac
