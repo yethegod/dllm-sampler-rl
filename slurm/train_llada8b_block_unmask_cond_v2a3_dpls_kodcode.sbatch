@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=128
 #SBATCH --mem=480g
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=llada8b-bu-a3-dpls-kodcode
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT,REQUEUE
