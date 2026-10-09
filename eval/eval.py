@@ -811,6 +811,14 @@ if __name__ == "__main__":
     if args.adaptive_block:
         assert args.batch_size == 1, "adaptive_block requires batch_size 1"
 
+    # The ablation's unmask policy config is parsed here too: parsing a Config resets
+    # AcceleratorState, so after Accelerator() it would leave accelerator.device unset.
+    u_config = None
+    if args.unmask_policy_path is not None:
+        (u_config,) = trl_parser.parse_args_and_config(
+            args=["--config", args.unmask_policy_config], fail_with_unknown_args=False
+        )
+
     # NOTE: setting up the accelerator must be done after parsing config
     accelerator = Accelerator()
 
@@ -994,9 +1002,6 @@ if __name__ == "__main__":
     # the main policy's blocks. Not prepared/wrapped: it only runs forward.
     unmask_policy = None
     if args.unmask_policy_path is not None:
-        (u_config,) = TrlParser((Config,)).parse_args_and_config(
-            args=["--config", args.unmask_policy_config], fail_with_unknown_args=False
-        )
         if u_config.policy_type != "dit_confidence" or not u_config.policy_full_context:
             raise ValueError(
                 "--unmask_policy_config must be a full-context dit_confidence policy, "
