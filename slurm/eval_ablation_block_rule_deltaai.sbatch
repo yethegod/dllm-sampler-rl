@@ -24,6 +24,8 @@
 # One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
 #   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math};
 #   or a comma-separated list, e.g. LANE=F32:gsm8k,FADA:gsm8k (finished cells are skipped)
+#   Pass a list through the environment (LANE=a,b sbatch --export=ALL ...), never as
+#   --export=ALL,LANE=a,b: sbatch splits --export on commas and keeps only the first cell.
 #   LANE=SMOKE  n_test 4 of every new path, plus an exactness check: FLRN with the
 #               block forced to 32 must equal F32.
 # Run serially by slurm/logs/ablation_block_rule_chain.sh (interactive QoS = 1 job).
