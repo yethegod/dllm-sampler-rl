@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180g
 #SBATCH --time=06:00:00
-#SBATCH --array=0-2
+#SBATCH --array=2
 #SBATCH --job-name=eval-kodcode-a3-delta
 #SBATCH --output=slurm/logs/%x_%A_%a.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT
@@ -15,7 +15,8 @@
 
 # GSM8K / MATH500 / HumanEval / MBPP eval of the final checkpoint (1064) of the alpha=3 KodCode
 # DPLS block_unmask run (train_llada8b_block_unmask_cond_v2a3_dpls_kodcode.sbatch). Everything
-# at --few_shot 0, greedy (dpls-greedy unmask + categorical-argmax block), deterministic, seed 42:
+# at --few_shot 0, greedy (dpls-greedy unmask + categorical-argmax block), deterministic, seed 42.
+# Only the code task (2) is in the array; the math tasks stay runnable with --array=0,1:
 #
 #   0  gsm8k                 -> $WORK/eval_results/kodcode_dpls/a3_dpls_kodcode
 #   1  math                  -> same
