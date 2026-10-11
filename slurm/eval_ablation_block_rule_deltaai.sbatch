@@ -20,7 +20,7 @@
 # llada8b_bl32_a1_dpls (dit_confidence, DPLS, alpha=1), last checkpoint unless FIX_CKPT.
 # FLRN runs the joint policy for block decisions and the fixed head for unmasking
 # (--unmask_policy_path). J8/J16/J64/J128 sweep the joint head's block size the same way
-# (--block_unmask_fixed_schedule); joint_b<b>. F8/F16/F64/F128 sweep the fixed head's block size (remasking=policy,
+# (--block_unmask_fixed_schedule); joint_b<b>. JADA16 = JADA with B0=16 (joint_ada_b16). F8/F16/F64/F128 sweep the fixed head's block size (remasking=policy,
 # so b must divide gen_length 256; b=96 is not run).
 # One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
 #   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math};
@@ -79,6 +79,7 @@ run_cell() {  # run_cell <cell> <dataset>
   case "$1" in
     J8|J16|J32|J64|J128) joint "$2" "joint_b${1#J}" --block_unmask_fixed_schedule "${1#J}" ;;
     JADA) joint "$2" joint_ada "${ADA[@]}" ;;
+    JADA16) joint "$2" joint_ada_b16 --adaptive_block --delimiter_threshold 0.3 --block_length 16 ;;
     F8|F16|F32|F64|F128) fixed "$2" "fixed_b${1#F}" "${1#F}" ;;
     FADA) fixed "$2" fixed_ada 32 "${ADA[@]}" ;;
     FLRN) joint "$2" fixed_learned "${UPOL_ARGS[@]}" ;;
