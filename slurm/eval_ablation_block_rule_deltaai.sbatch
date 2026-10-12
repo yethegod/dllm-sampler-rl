@@ -23,6 +23,8 @@
 # (--block_unmask_fixed_schedule); joint_b<b>. JADA16 = JADA with B0=16 (joint_ada_b16).
 # F8/F16/F64/F128 sweep the fixed head's block size (remasking=policy,
 # so b must divide gen_length 256; b=96 is not run).
+# JNOWIN = the joint policy with its window embedding zeroed (--zero_window_cond):
+# learned block head, unmask head not told its block; joint_nowin.
 # One lane = one cell x one dataset, ~20-50 min on 2 GH200s:
 #   LANE=<cell>:<dataset>, e.g. LANE=JADA:gsm8k, dataset in {gsm8k, math};
 #   or a comma-separated list, e.g. LANE=F32:gsm8k,FADA:gsm8k (finished cells are skipped)
@@ -81,6 +83,7 @@ run_cell() {  # run_cell <cell> <dataset>
     J8|J16|J32|J64|J128) joint "$2" "joint_b${1#J}" --block_unmask_fixed_schedule "${1#J}" ;;
     JADA) joint "$2" joint_ada "${ADA[@]}" ;;
     JADA16) joint "$2" joint_ada_b16 --adaptive_block --delimiter_threshold 0.3 --block_length 16 ;;
+    JNOWIN) joint "$2" joint_nowin --zero_window_cond ;;
     F8|F16|F32|F64|F128) fixed "$2" "fixed_b${1#F}" "${1#F}" ;;
     FADA) fixed "$2" fixed_ada 32 "${ADA[@]}" ;;
     FLRN) joint "$2" fixed_learned "${UPOL_ARGS[@]}" ;;

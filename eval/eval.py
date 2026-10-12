@@ -738,6 +738,16 @@ if __name__ == "__main__":
         help="Experiment config the --unmask_policy_path policy was trained with",
     )
     parser.add_argument(
+        "--zero_window_cond",
+        action="store_true",
+        help=(
+            "For --remasking block_unmask_policy with a window-conditioned policy: "
+            "zero its window embedding after loading, so the unmask head decodes "
+            "without being told its block, p(u | s) instead of p(u | s, b). The "
+            "block head is unchanged. Ablation of the conditioning at eval time."
+        ),
+    )
+    parser.add_argument(
         "--record_unmask_order",
         action="store_true",
         help="Store per-example (L,) unmask step indices in the generations JSON",
@@ -758,11 +768,14 @@ if __name__ == "__main__":
     if (
         args.block_unmask_fixed_schedule is not None
         or args.block_unmask_cond_block is not None
+        or args.zero_window_cond
     ) and args.remasking != "block_unmask_policy":
         parser.error(
-            "--block_unmask_fixed_schedule / --block_unmask_cond_block need "
-            "--remasking block_unmask_policy"
+            "--block_unmask_fixed_schedule / --block_unmask_cond_block / "
+            "--zero_window_cond need --remasking block_unmask_policy"
         )
+    if args.zero_window_cond and args.block_unmask_cond_block is not None:
+        parser.error("--zero_window_cond makes --block_unmask_cond_block a no-op")
     if (args.unmask_policy_path is None) != (args.unmask_policy_config is None):
         parser.error("--unmask_policy_path and --unmask_policy_config go together")
     if args.unmask_policy_path is not None and args.remasking != "block_unmask_policy":
@@ -998,6 +1011,20 @@ if __name__ == "__main__":
             state = load_file(args.policy_path)
             policy.load_state_dict(state)
 
+        if args.zero_window_cond:
+            # Ablation of the block conditioning: with the embedding at zero the
+            # unmask head's trunk pass equals the block head's, i.e. the window_cond=False
+            # policy with the same weights. The loop still runs the second pass.
+            if not getattr(policy_core, "window_cond", False):
+                raise ValueError(
+                    "--zero_window_cond needs a window-conditioned policy "
+                    "(block_unmask_window_cond: true in the config)"
+                )
+            with torch.no_grad():
+                policy_core.window_embedding.weight.zero_()
+            if accelerator.is_main_process:
+                print("Window embedding zeroed: unmask head is not told its block")
+
     # Ablation: a second, separately trained per-position policy that unmasks inside
     # the main policy's blocks. Not prepared/wrapped: it only runs forward.
     unmask_policy = None
@@ -1126,6 +1153,8 @@ if __name__ == "__main__":
                 )
             if args.block_unmask_cond_block is not None:
                 label += f"_cond{args.block_unmask_cond_block}"
+            if args.zero_window_cond:
+                label += "_nowin"
             if args.unmask_policy_path is not None:
                 label += "_upol"
             args.block_length = label
@@ -1172,6 +1201,7 @@ if __name__ == "__main__":
                 if args.block_unmask_fixed_schedule is not None
                 else None,
                 "block_unmask_cond_block": args.block_unmask_cond_block,
+                "zero_window_cond": args.zero_window_cond,
                 "unmask_policy_path": args.unmask_policy_path,
                 "n_test": args.n_test,
                 "few_shot": args.few_shot,

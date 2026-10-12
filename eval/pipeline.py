@@ -38,6 +38,7 @@ class EvalConfig:
     block_sampling_mode: str | None = None
     block_unmask_fixed_schedule: str | None = None
     block_unmask_cond_block: int | None = None
+    zero_window_cond: bool = False
     unmask_policy_path: str | None = None
     unmask_policy_config: str | None = None
     record_unmask_order: bool = False
@@ -186,6 +187,8 @@ def run_eval(
                 output_dir = Path(f"{output_dir}_fixed{tag}")
             if cfg.block_unmask_cond_block is not None:
                 output_dir = Path(f"{output_dir}_cond{cfg.block_unmask_cond_block}")
+            if cfg.zero_window_cond:
+                output_dir = Path(f"{output_dir}_nowin")
             if cfg.unmask_policy_path:
                 # Name the swapped-in unmask head by its run and checkpoint.
                 upol = Path(cfg.unmask_policy_path).parent
@@ -252,6 +255,8 @@ def run_eval(
             )
         if cfg.block_unmask_cond_block is not None:
             cmd.extend(["--block_unmask_cond_block", str(cfg.block_unmask_cond_block)])
+        if cfg.zero_window_cond:
+            cmd.append("--zero_window_cond")
         if cfg.unmask_policy_path:
             cmd.extend(
                 [
@@ -397,6 +402,12 @@ def main():
         "unmask head is told, independent of the real block.",
     )
     parser.add_argument(
+        "--zero_window_cond",
+        action="store_true",
+        help="For --remasking block_unmask_policy: zero the window embedding of a "
+        "window-conditioned policy, so the unmask head is not told its block.",
+    )
+    parser.add_argument(
         "--unmask_policy_path",
         default=None,
         help="For --remasking block_unmask_policy: model.safetensors of a dit_confidence "
@@ -425,6 +436,8 @@ def main():
         parser.error("--unmask_policy_path and --unmask_policy_config go together")
     if args.unmask_policy_path and args.remasking != "block_unmask_policy":
         parser.error("--unmask_policy_path needs --remasking block_unmask_policy")
+    if args.zero_window_cond and args.remasking != "block_unmask_policy":
+        parser.error("--zero_window_cond needs --remasking block_unmask_policy")
 
     run_paths = (
         args.run_paths.split(";")
@@ -461,6 +474,7 @@ def main():
             block_sampling_mode=args.block_sampling_mode,
             block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
             block_unmask_cond_block=args.block_unmask_cond_block,
+            zero_window_cond=args.zero_window_cond,
             unmask_policy_path=args.unmask_policy_path,
             unmask_policy_config=args.unmask_policy_config,
             record_unmask_order=args.record_unmask_order,
