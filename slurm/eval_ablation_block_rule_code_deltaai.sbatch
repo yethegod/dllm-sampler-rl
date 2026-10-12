@@ -16,6 +16,7 @@
 # greedy (dpls-greedy unmask + categorical-argmax block), seed 42:
 #   J8/J16/J32/J64/J128  constant block size (--block_unmask_fixed_schedule) -> joint_b<b>
 #   JADA / JADA16        AdaBlock rule, tau_D 0.3, B0 = 32 / 16                -> joint_ada / joint_ada_b16
+#   JT<tau>              learned block head + Fast-dLLM threshold tau (no unmask head) -> joint_thres<tau>
 # The learned diagonal is the existing a1 KodCode eval (HumanEval 41.5 @ 71.5,
 # MBPP 39.4 @ 49.9 in code/a1_dpls_kodcode and code_mbpp0shot/a1_dpls_kodcode).
 # One lane = one cell x one dataset, ~8 (HumanEval) to ~15 (MBPP) min on 2 GH200s:
@@ -58,6 +59,7 @@ run_cell() {  # run_cell <cell> <dataset>
     J8|J16|J32|J64|J128) joint "$2" "joint_b${1#J}" --block_unmask_fixed_schedule "${1#J}" ;;
     JADA) joint "$2" joint_ada --adaptive_block --delimiter_threshold 0.3 --block_length 32 ;;
     JADA16) joint "$2" joint_ada_b16 --adaptive_block --delimiter_threshold 0.3 --block_length 16 ;;
+    JT0.9|JT0.7|JT0.5) joint "$2" "joint_thres${1#JT}" --block_unmask_threshold "${1#JT}" ;;
     *) echo "unknown cell $1"; exit 2 ;;
   esac
 }

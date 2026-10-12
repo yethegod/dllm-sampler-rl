@@ -105,6 +105,7 @@ def generate_unified(
     block_unmask_fixed_schedule: tuple[int, ...] | None = None,
     block_unmask_cond_block: int | None = None,
     unmask_policy=None,
+    block_unmask_threshold: float | None = None,
     cadllm_task: str | None = None,
 ) -> GenerationResult:
     if record_probe_data and adaptive_block:
@@ -231,6 +232,14 @@ def generate_unified(
         raise ValueError(
             f"unmask_policy only applies to remasking='block_unmask_policy', got {remasking!r}"
         )
+    if block_unmask_threshold is not None:
+        if remasking != "block_unmask_policy":
+            raise ValueError(
+                "block_unmask_threshold only applies to remasking='block_unmask_policy', "
+                f"got {remasking!r}"
+            )
+        if unmask_policy is not None:
+            raise ValueError("block_unmask_threshold and unmask_policy are exclusive")
 
     if adaptive_block:
         if remasking not in ["policy", "fastdllm", "block_unmask_policy"]:
@@ -687,6 +696,7 @@ def generate_unified(
             adaptive_block_length=block_length if adaptive_block else None,
             delimiter_ids=delimiter_ids,
             delimiter_threshold=delimiter_threshold,
+            unmask_threshold=block_unmask_threshold,
         )
     elif remasking == "cadllm":
         # Top-V confidences need the raw logits, so skip _forward_logits' full softmax.
@@ -1312,6 +1322,7 @@ def _block_unmask_policy_loop(
     adaptive_block_length: int | None = None,
     delimiter_ids: tuple[int, ...] = (198,),
     delimiter_threshold: float = 0.3,
+    unmask_threshold: float | None = None,
 ) -> dict:
     """Decode with a learned block size AND a learned per-position unmasking policy.
 
@@ -1353,6 +1364,12 @@ def _block_unmask_policy_loop(
     separately trained dit_confidence policy fed the same (mask, confidence, step/L)
     it reads in its own full-context loop; it is never told the window. With a fixed
     schedule of 32 that reproduces remasking='policy' at block_length 32 exactly.
+    ``unmask_threshold=tau`` replaces the unmask head with Fast-dLLM's rule inside the
+    block head's windows (every in-block position with confidence above tau, else the
+    most confident one); the unmask head is not run, its logits are recorded as zeros
+    and the record holds the 0/1 commit mask. With a fixed schedule of b that
+    reproduces remasking='fastdllm' at block_length b exactly, so the cell isolates
+    the block head against a fixed block under one and the same unmask rule.
 
     :return: dict of GenerationResult fields:
         sampling_inputs (B,T,L+K) = [unmask logits | block logits]
@@ -1457,22 +1474,29 @@ def _block_unmask_policy_loop(
         end_in = block_end.unsqueeze(-1).clone()  # (B, 1)
         if cond_block is not None:
             end_in = (block_start + cond_block).clamp(max=L).unsqueeze(-1)
-        if unmask_policy is not None:
-            unmask_logits = unmask_policy(mask_index, c, per_batch_timestep)
-        else:
-            unmask_logits = policy.unmask_logits(
-                mask_index, c, per_batch_timestep, start_in, end_in
-            )
-        if temperature_policy != 1.0:
-            unmask_logits = unmask_logits / temperature_policy
-
         block_index = (positions >= block_start.unsqueeze(-1)) & (
             positions < block_end.unsqueeze(-1)
         )  # (B, L)
         sampling_mask = mask_index & block_index
-        record_samples, unmask = _block_unmask_sample(
-            unmask_logits, sampling_mask, sampling_mode, dpls_stop_logit
-        )
+        if unmask_threshold is not None:
+            # Fast-dLLM's rule inside the learned windows; no unmask head, no logits.
+            unmask_logits = torch.zeros((B, L), dtype=torch.float32, device=device)
+            unmask = _confidence_threshold_unmask_rowwise(
+                sampling_mask, probs, unmask_threshold
+            )
+            record_samples = unmask.long()
+        else:
+            if unmask_policy is not None:
+                unmask_logits = unmask_policy(mask_index, c, per_batch_timestep)
+            else:
+                unmask_logits = policy.unmask_logits(
+                    mask_index, c, per_batch_timestep, start_in, end_in
+                )
+            if temperature_policy != 1.0:
+                unmask_logits = unmask_logits / temperature_policy
+            record_samples, unmask = _block_unmask_sample(
+                unmask_logits, sampling_mask, sampling_mode, dpls_stop_logit
+            )
 
         history.append(
             {

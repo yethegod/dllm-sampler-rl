@@ -204,6 +204,7 @@ def evaluate(
     block_unmask_fixed_schedule=None,
     block_unmask_cond_block=None,
     unmask_policy=None,
+    block_unmask_threshold=None,
     record_unmask_order=False,
     record_policy_trace=False,
 ):
@@ -307,6 +308,7 @@ def evaluate(
                         "block_unmask_fixed_schedule": block_unmask_fixed_schedule,
                         "block_unmask_cond_block": block_unmask_cond_block,
                         "unmask_policy": unmask_policy,
+                        "block_unmask_threshold": block_unmask_threshold,
                     }
                 )
             if record_unmask_order:
@@ -738,6 +740,17 @@ if __name__ == "__main__":
         help="Experiment config the --unmask_policy_path policy was trained with",
     )
     parser.add_argument(
+        "--block_unmask_threshold",
+        type=float,
+        default=None,
+        help=(
+            "For --remasking block_unmask_policy: replace the unmask head by Fast-dLLM's "
+            "confidence threshold (this value) inside the blocks the block head picks. "
+            "With --block_unmask_fixed_schedule b this equals Fast-dLLM at block b, so "
+            "the pair isolates the block head under one unmask rule."
+        ),
+    )
+    parser.add_argument(
         "--zero_window_cond",
         action="store_true",
         help=(
@@ -769,10 +782,21 @@ if __name__ == "__main__":
         args.block_unmask_fixed_schedule is not None
         or args.block_unmask_cond_block is not None
         or args.zero_window_cond
+        or args.block_unmask_threshold is not None
     ) and args.remasking != "block_unmask_policy":
         parser.error(
             "--block_unmask_fixed_schedule / --block_unmask_cond_block / "
-            "--zero_window_cond need --remasking block_unmask_policy"
+            "--zero_window_cond / --block_unmask_threshold need "
+            "--remasking block_unmask_policy"
+        )
+    if args.block_unmask_threshold is not None and (
+        args.unmask_policy_path is not None
+        or args.zero_window_cond
+        or args.block_unmask_cond_block is not None
+    ):
+        parser.error(
+            "--block_unmask_threshold replaces the unmask head: it excludes "
+            "--unmask_policy_path, --zero_window_cond and --block_unmask_cond_block"
         )
     if args.zero_window_cond and args.block_unmask_cond_block is not None:
         parser.error("--zero_window_cond makes --block_unmask_cond_block a no-op")
@@ -1122,6 +1146,7 @@ if __name__ == "__main__":
         block_unmask_fixed_schedule=args.block_unmask_fixed_schedule,
         block_unmask_cond_block=args.block_unmask_cond_block,
         unmask_policy=unmask_policy,
+        block_unmask_threshold=args.block_unmask_threshold,
         record_unmask_order=args.record_unmask_order,
         record_policy_trace=args.record_policy_trace,
     )
@@ -1157,6 +1182,8 @@ if __name__ == "__main__":
                 label += "_nowin"
             if args.unmask_policy_path is not None:
                 label += "_upol"
+            if args.block_unmask_threshold is not None:
+                label += f"_thres{args.block_unmask_threshold}"
             args.block_length = label
         elif args.adaptive_block:
             # Label adaptive-block runs distinctly so filenames and aggregation don't
@@ -1202,6 +1229,7 @@ if __name__ == "__main__":
                 else None,
                 "block_unmask_cond_block": args.block_unmask_cond_block,
                 "zero_window_cond": args.zero_window_cond,
+                "block_unmask_threshold": args.block_unmask_threshold,
                 "unmask_policy_path": args.unmask_policy_path,
                 "n_test": args.n_test,
                 "few_shot": args.few_shot,
