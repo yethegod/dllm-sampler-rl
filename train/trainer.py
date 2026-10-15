@@ -1611,10 +1611,26 @@ class Trainer(GRPOTrainer):
             self._metrics[mode]["num_blocks_mean"].append(
                 per_row_blocks.mean().item()
             )
-            for i, b in enumerate(self.args.block_size_candidates):
-                self._metrics[mode][f"block_size/frac_{b}"].append(
-                    (counts_b[i] / n_dec).item()
-                )
+            if len(cand_b) <= 16:
+                for i, b in enumerate(self.args.block_size_candidates):
+                    self._metrics[mode][f"block_size/frac_{b}"].append(
+                        (counts_b[i] / n_dec).item()
+                    )
+            else:
+                # A dense candidate set (e.g. every b in 1..128) would log one scalar
+                # per size; bin into power-of-two ranges (1-8, 9-16, 17-32, ...)
+                # instead, named by their upper edge. Not "frac_":
+                # eval/monitor_block_head.py parses block_size/frac_<int> as one size.
+                edges = [8]
+                while edges[-1] < int(cand_b.max().item()):
+                    edges.append(2 * edges[-1])
+                lo = 0
+                for hi in edges:
+                    in_bin = (cand_b > lo) & (cand_b <= hi)
+                    self._metrics[mode][f"block_size/bin_le{hi}"].append(
+                        (counts_b[in_bin].sum() / n_dec).item()
+                    )
+                    lo = hi
             if has_thres:
                 self._metrics[mode]["threshold/mean"].append(
                     (totals[2] / n_dec).item()

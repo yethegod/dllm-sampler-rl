@@ -1,0 +1,137 @@
+#
+# For licensing see accompanying LICENSE file.
+# Copyright (C) 2026 Apple Inc. All Rights Reserved.
+#
+### Adapted from https://github.com/dllm-reasoning/d1 (Apache 2.0)
+#
+# Block-size-only policy, hidden-state input, token-level block boundaries.
+# Derived from llada_8b_instruct_dit_blocksize_only.yaml (b only, Fast-dLLM
+# threshold pinned at 0.9, alpha=1); exactly three fields differ:
+#   - policy_type dit_block_size_hidden_proj: the policy reads the dLLM's
+#     last-layer hidden state through Linear(4096 -> policy_hidden_dim) instead of
+#     top-p confidences. Motivation: the confidence input could not predict the
+#     per-question oracle b (AUC 0.56), so the input, not the action, looked like
+#     the bottleneck.
+#   - block_size_candidates every b in 1..128 instead of {8,...,128}. The block
+#     head already scores a boundary after every position (policy.py:
+#     boundary_block_logits); this just stops discarding all but 7 of them.
+#   - timestep_batch_size 8, as in the joint hidden-proj config.
+#
+# Smallest candidate 1 => T_cap = L = 256 decisions per row. The rollout grows its
+# decision buffers on demand (generation.py), so memory follows the decisions
+# actually made: ~67 MiB of hidden-state stream per decision slot at
+# per_device_train_batch_size 32, padded to the batch's busiest row. The trainer
+# backwards each timestep chunk as it goes, so the loss does not scale with T.
+#
+# The bar at alpha=1 is unchanged from the parent config: fixed b=64, tau=0.9:
+# 80.67% / 78.0 NFE / E[R] 0.5734 on GSM8K.
+
+# ModelConfig
+torch_dtype: bfloat16
+load_in_4bit: false
+model_path: GSAI-ML/LLaDA-8B-Instruct
+
+attn_implementation: flash_attention_2
+
+# GRPOConfig
+dataset: gsm8k_and_math
+seed: 123
+bf16: false
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_steps: 100
+logging_steps: 1
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+reward_functions:
+  - mixed_correctness_mult_reward_func
+  - mixed_correctness_reward_func
+reward_weights:
+  - 1.0
+  - 0.0
+
+# Standard GRPO group size, halved from the joint run's 16 because the action
+# space also halved (15 -> 7). Measured on the tau=0.9 grid, this costs little:
+# the fraction of steps GRPO skips for zero reward variance goes 12.00% (G=16) ->
+# 12.58% (G=8), against a G-independent floor of 11.90% (prompts no action
+# solves), and expected action coverage per group is 71% here vs 67% in the joint
+# run. The real trade is a 1.41x noisier group-mean baseline in exchange for 16
+# prompts per optimizer step instead of 8 at the same wall-clock. If entropy sits
+# pinned near ln 7 with no reward movement for a few hundred steps, raising this
+# back to 16 is the first knob.
+num_generations: 8
+num_train_epochs: 1
+
+per_device_eval_batch_size: 1
+# 8 GPUs x 16 = 128 = generation_batch_size. On DeltaAI's 4xGH200 the sbatch
+# passes --per_device_train_batch_size 32 to keep that product at 128.
+per_device_train_batch_size: 16
+gradient_accumulation_steps: 1
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+# Parameters for saving checkpoints
+save_steps: 50
+save_strategy: steps
+save_total_limit: 500
+
+# Diffusion and GRPO-specific
+max_completion_length: 256
+max_prompt_length: 200
+# Unused by remasking=block_policy (the policy picks the block length per block);
+# kept only because Config requires a value.
+block_length: 64
+generation_batch_size: 128
+remasking: block_policy
+beta: 0.
+epsilon: 0.5
+num_iterations: 2
+loglikelihood_dtype: float32
+
+# alpha=1 is the reward's linear-decay setting; see the alpha semantics comment
+# in train/reward_func.py:_multiplicative_step_scaling_reward_func. Note the bar
+# is b=64 at every alpha in this row, so alpha controls how much accuracy the
+# policy may trade for speed, not which constant it has to beat.
+alpha_compute_reward: 1.0
+
+# Policy specific
+policy_type: dit_block_size_hidden_proj
+policy_hidden_dim: 128
+policy_feedforward_dim: 512
+policy_num_heads: 2
+policy_num_blocks: 1
+policy_dropout: 0.0
+policy_time_embed_dim: 128
+policy_full_context: true
+policy_smart_init: -2.0
+
+# The input stream is (B,T,L,4096); compute_loss casts each timestep chunk to
+# fp32 and backwards it before the next.
+timestep_batch_size: 8
+sampling_mode: categorical
+
+# 128 block sizes x 1 threshold = 128 actions (ln 128 = 4.852 nats). A smallest
+# candidate of 1 always fits, so blocks tile [0, L) for any choice sequence and the
+# feasibility mask (b <= remaining) is the only constraint.
+block_size_candidates: [
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+  24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+  45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+  66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86,
+  87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+  106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+  123, 124, 125, 126, 127, 128
+]
+threshold_candidates: [0.9]

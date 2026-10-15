@@ -510,27 +510,47 @@ def generate_unified(
 
         # Decision-indexed buffers: slot t holds a row's t-th decision, NOT the t-th
         # forward pass. Rows decide on different steps, so packing by decision keeps
-        # T at the number of blocks (<=32) instead of the number of forwards.
-        def _buf(*shape, dtype=torch.float32):
-            return torch.zeros((B, T_cap, *shape), dtype=dtype, device=x.device)
+        # T at the number of blocks instead of the number of forwards.
+        #
+        # Allocated at min(T_cap, 32) slots and doubled on demand, not at T_cap: with
+        # a smallest candidate of 1, T_cap = L, and the hidden-state stream alone would
+        # preallocate (B, 256, L, 4096) bf16 -- 17 GiB at B = 32 -- for rollouts that
+        # typically make a handful of decisions per row.
+        rec_T = min(T_cap, 32)
+        rec = {}
 
-        rec_block_logits = _buf(len(cand_b))
-        rec_thres_logits = _buf(len(cand_t))
-        rec_actions = _buf(2, dtype=torch.long)
-        rec_mask = _buf(1, dtype=torch.bool)
-        rec_m = _buf(L, dtype=torch.bool)
+        def _buf(name, *shape, dtype=torch.float32):
+            rec[name] = torch.zeros((B, rec_T, *shape), dtype=dtype, device=x.device)
+
+        def _grow(need):
+            nonlocal rec_T
+            new_T = rec_T
+            while new_T < need:
+                new_T = min(2 * new_T, T_cap)
+            if new_T == rec_T:
+                return
+            for name, buf in rec.items():
+                pad = buf.new_zeros((B, new_T - rec_T, *buf.shape[2:]))
+                rec[name] = torch.cat([buf, pad], dim=1)
+            rec_T = new_T
+
+        _buf("block_logits", len(cand_b))
+        _buf("thres_logits", len(cand_t))
+        _buf("actions", 2, dtype=torch.long)
+        _buf("mask", 1, dtype=torch.bool)
+        _buf("m", L, dtype=torch.bool)
         # The policy's input stream: top-p confidences, or the dLLM's last-layer
         # hidden state for the hidden-proj variant. Kept in the dLLM's own dtype
-        # there -- upcasting 4096 channels to fp32 would double a buffer that is
-        # already preallocated at full T_cap, and the policy recasts on use anyway.
+        # there -- upcasting 4096 channels to fp32 would double the largest buffer
+        # on this path, and the policy recasts on use anyway.
         if wants_hidden:
-            rec_c = _buf(L, base_model.config.hidden_size, dtype=base_model.dtype)
+            _buf("c", L, base_model.config.hidden_size, dtype=base_model.dtype)
         else:
-            rec_c = _buf(L, confidences_top_p)
-        rec_t = _buf(1)
-        rec_start = _buf(1, dtype=torch.long)
-        rec_block_size = _buf(dtype=torch.long)
-        rec_thres = _buf()
+            _buf("c", L, confidences_top_p)
+        _buf("t", 1)
+        _buf("start", 1, dtype=torch.long)
+        _buf("block_size", dtype=torch.long)
+        _buf("thres")
 
         positions = torch.arange(L, device=x.device)
 
@@ -616,20 +636,21 @@ def generate_unified(
                 )
 
                 rows = needs.nonzero(as_tuple=True)[0]
+                _grow(min(int(dec_count[rows].max().item()) + 1, T_cap))
                 # The tiling invariant caps decisions at T_cap; clamp defensively so a
                 # violation corrupts one slot instead of raising an indexing error.
                 slot = dec_count[rows].clamp(max=T_cap - 1)
-                rec_block_logits[rows, slot] = block_logits[rows].float()
-                rec_thres_logits[rows, slot] = thres_logits[rows].float()
-                rec_actions[rows, slot, 0] = b_idx[rows]
-                rec_actions[rows, slot, 1] = t_idx[rows]
-                rec_mask[rows, slot, 0] = True
-                rec_m[rows, slot] = mask_index[rows]
-                rec_c[rows, slot] = policy_stream[rows].to(rec_c.dtype)
-                rec_t[rows, slot, 0] = per_batch_timestep[rows, 0].float()
-                rec_start[rows, slot, 0] = block_start[rows]
-                rec_block_size[rows, slot] = chosen_b[rows]
-                rec_thres[rows, slot] = chosen_t[rows]
+                rec["block_logits"][rows, slot] = block_logits[rows].float()
+                rec["thres_logits"][rows, slot] = thres_logits[rows].float()
+                rec["actions"][rows, slot, 0] = b_idx[rows]
+                rec["actions"][rows, slot, 1] = t_idx[rows]
+                rec["mask"][rows, slot, 0] = True
+                rec["m"][rows, slot] = mask_index[rows]
+                rec["c"][rows, slot] = policy_stream[rows].to(rec["c"].dtype)
+                rec["t"][rows, slot, 0] = per_batch_timestep[rows, 0].float()
+                rec["start"][rows, slot, 0] = block_start[rows]
+                rec["block_size"][rows, slot] = chosen_b[rows]
+                rec["thres"][rows, slot] = chosen_t[rows]
                 dec_count = dec_count + needs.long()
 
             block_index = (positions >= block_start.unsqueeze(-1)) & (
@@ -658,19 +679,20 @@ def generate_unified(
             # Both heads' logits share one tensor so the trainer's generic time-axis
             # slicing works unchanged; it splits them back at len(cand_b).
             "sampling_inputs": torch.cat(
-                [rec_block_logits[:, :T_max], rec_thres_logits[:, :T_max]], dim=-1
+                [rec["block_logits"][:, :T_max], rec["thres_logits"][:, :T_max]],
+                dim=-1,
             ),
-            "samples": rec_actions[:, :T_max],
-            "sampling_masks": rec_mask[:, :T_max],
+            "samples": rec["actions"][:, :T_max],
+            "sampling_masks": rec["mask"][:, :T_max],
             "policy_inputs": (
-                rec_m[:, :T_max],
-                rec_c[:, :T_max],
-                rec_t[:, :T_max],
-                rec_start[:, :T_max],
+                rec["m"][:, :T_max],
+                rec["c"][:, :T_max],
+                rec["t"][:, :T_max],
+                rec["start"][:, :T_max],
             ),
-            "block_sizes_chosen": rec_block_size[:, :T_max],
-            "thresholds_chosen": rec_thres[:, :T_max],
-            "block_decisions": rec_mask[:, :T_max, 0],
+            "block_sizes_chosen": rec["block_size"][:, :T_max],
+            "thresholds_chosen": rec["thres"][:, :T_max],
+            "block_decisions": rec["mask"][:, :T_max, 0],
         }
     elif remasking == "block_unmask_policy":
         block_policy_data = _block_unmask_policy_loop(
