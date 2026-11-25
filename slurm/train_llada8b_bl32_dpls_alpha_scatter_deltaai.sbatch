@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --account=bhta-dtai-gh
 #SBATCH --partition=ghx4
-#SBATCH --nodes=1
 #SBATCH --ntasks=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=4500M
+#SBATCH --mem-per-cpu=7000M
 #SBATCH --time=02:00:00
 #SBATCH --job-name=llada8b-bl32-dpls-alpha-sc
 #SBATCH --output=slurm/logs/%x_%j.out
@@ -15,11 +14,9 @@
 # On a full ghx4 a 48-hour (or even 2-hour) node is a day away, while a 30-minute job
 # backfills within the hour.
 #
-# --nodes=1 is deliberate. Without it Slurm 25.11 spread the job over two nodes with
-# 1 + 3 tasks but 2 + 2 GPUs (job 3678103), so two ranks landed on one GPU ("Duplicate
-# GPU detected"). The launcher itself is node-agnostic and probes the layout before
-# training, so `--nodes=2 --ntasks-per-node=2 --gpus-per-node=2` on the command line is a
-# valid alternative; a bare multi-node --ntasks=4 is not.
+# The 4 GPUs may sit on one node or on several: with no whole node free, 1 + 1 + 2 spare
+# GPUs on three nodes are still a slice. See the launcher at the bottom for how ranks are
+# placed. (ghx4-interactive caps a job at 2 nodes; add --nodes=1 for the whole-node layout.)
 #
 # The run itself is unchanged: 4 DDP ranks x per-device batch 32 = generation_batch_size
 # 128. Only the launcher differs: `accelerate launch` spawns its ranks on one node, so each
@@ -147,34 +144,79 @@ if [ -n "$last" ]; then
   fi
 fi
 
-# torchrun's contract, by hand: rank 0 runs on the first node of the allocation (block
-# distribution) and hosts the rendezvous. --gpu-bind=none: every task sees all of the
-# job's GPUs on its node and picks its own by LOCAL_RANK (accelerate: local rank modulo
-# visible device count). With the default per-task binding each task sees only "GPU 0",
-# and NCCL fails with "invalid device ordinal" as soon as two ranks share a node.
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+# torchrun's contract, by hand, with ranks placed by GPU rather than by Slurm task.
+# For a --gpus-per-task job Slurm lays out tasks (CPUs, memory) and GPUs independently:
+# job 3678103 got 1 + 3 tasks but 2 + 2 GPUs on two nodes, and one srun over the tasks put
+# two ranks on one GPU. So: read how many of the job's GPUs each node holds, then start
+# one step per node with that many ranks. --gpu-bind=none lets every rank see all of its
+# node's GPUs and take its own by LOCAL_RANK (accelerate: local rank modulo visible
+# devices); with per-task binding NCCL fails ("invalid device ordinal") as soon as two
+# ranks share a node.
+TOTAL=$SLURM_NTASKS
+# Per-node GPUs and CPUs straight from the job record, e.g.
+#   Nodes=gh[093,152] CPU_IDs=0-7 Mem=56000 GRES=gpu:nvidia_gh200_120gb:2(IDX:0,3)
+# (A probe step cannot tell: it inherits the job's one-GPU-per-task rule and sees only
+# as many GPUs as it has tasks.)
+NODES=(); CPN=(); declare -A GPUS
+while read -r host g c; do
+  [ -n "$host" ] || continue
+  NODES+=("$host"); CPN+=("$c"); GPUS[$host]=$g
+done < <(scontrol show job -d "$SLURM_JOB_ID" | python -c '
+import re, subprocess, sys
+for line in sys.stdin:
+    m = re.match(r"\s+Nodes=(\S+) CPU_IDs=(\S+) Mem=\d+ GRES=(\S*)", line)
+    if not m:
+        continue
+    hosts = subprocess.run(["scontrol", "show", "hostnames", m.group(1)],
+                           capture_output=True, text=True).stdout.split()
+    ncpu = 0
+    for part in m.group(2).split(","):
+        a, _, b = part.partition("-")
+        ncpu += int(b or a) - int(a) + 1
+    g = re.search(r":(\d+)\(IDX", m.group(3))
+    for h in hosts:
+        print(h, g.group(1) if g else 0, ncpu)
+')
+sum=0; ok=1; MASTER_ADDR=
+for i in "${!NODES[@]}"; do
+  n=${NODES[$i]}; g=${GPUS[$n]:-0}; c=${CPN[$i]:-0}
+  echo "[layout] $n: $g GPU(s), $c CPU(s)"
+  sum=$((sum + g))
+  [ "$g" -eq 0 ] && continue
+  [ -z "$MASTER_ADDR" ] && MASTER_ADDR=$n
+  # 4 CPUs per rank is also the memory floor: 4 x --mem-per-cpu = 28 GB, a rank peaks at 21.
+  [ $((c / g)) -ge 4 ] || ok=0
+done
+if [ "$sum" -ne "$TOTAL" ] || [ "$ok" -ne 1 ]; then
+  echo "=== unusable layout on $SLURM_JOB_NODELIST ($sum of $TOTAL GPUs found, or a node with too few CPUs per GPU); not training in this slice."
+  exit 3
+fi
+export MASTER_ADDR
 export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
-export WORLD_SIZE=$SLURM_NTASKS
+export WORLD_SIZE=$TOTAL
 export TRAIN_CONFIG=$CONFIG TRAIN_OUT=$OUTPUT_DIR
 export TRAIN_EXTRA="${EXTRA[*]}"
 echo "ranks: $WORLD_SIZE, rendezvous $MASTER_ADDR:$MASTER_PORT"
-# Layout probe: a rank takes GPU (local rank mod visible GPUs), so every node must show
-# its tasks at least as many GPUs as it runs tasks. Fail in seconds, not after model load.
-if ! srun --ntasks="$SLURM_NTASKS" --gpus-per-task=1 --gpu-bind=none --cpus-per-task=8 \
-     --distribution=block bash -c '
-       n=$(echo "${CUDA_VISIBLE_DEVICES:-}" | tr "," "\n" | grep -c .)
-       echo "[probe] $(hostname -s) local rank $SLURM_LOCALID sees $n GPU(s)"
-       [ "$SLURM_LOCALID" -lt "$n" ]'; then
-  echo "=== task/GPU layout mismatch on $SLURM_JOB_NODELIST; not training in this slice."
-  exit 3
-fi
-srun --ntasks="$SLURM_NTASKS" --gpus-per-task=1 --gpu-bind=none --cpus-per-task=8 \
-  --distribution=block --kill-on-bad-exit=1 bash -c '
-    export RANK=$SLURM_PROCID LOCAL_RANK=$SLURM_LOCALID
-    echo "[rank $RANK] $(hostname) local rank $LOCAL_RANK CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
-    exec python -m train.train --config "$TRAIN_CONFIG" --per_device_train_batch_size 32 \
-      $TRAIN_EXTRA --output_dir "$TRAIN_OUT"'
-rc=$?
+off=0; pids=()
+for i in "${!NODES[@]}"; do
+  n=${NODES[$i]}; g=${GPUS[$n]:-0}; c=${CPN[$i]}
+  [ "$g" -eq 0 ] && continue
+  RANK_OFFSET=$off srun --nodes=1 --ntasks="$g" --nodelist="$n" --gpus-per-task=1 --gpu-bind=none \
+    --cpus-per-task=$((c / g)) --kill-on-bad-exit=1 bash -c '
+      export RANK=$((RANK_OFFSET + SLURM_LOCALID)) LOCAL_RANK=$SLURM_LOCALID
+      export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+      echo "[rank $RANK] $(hostname -s) local rank $LOCAL_RANK CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} cpus $SLURM_CPUS_PER_TASK"
+      exec python -m train.train --config "$TRAIN_CONFIG" --per_device_train_batch_size 32 \
+        $TRAIN_EXTRA --output_dir "$TRAIN_OUT"' &
+  pids+=($!)
+  off=$((off + g))
+done
+# One step per node: if any of them dies, stop the others instead of letting them hang.
+rc=0
+for ((k = 0; k < ${#pids[@]}; k++)); do
+  wait -n "${pids[@]}" || { rc=$?; kill "${pids[@]}" 2>/dev/null; break; }
+done
+wait
 echo "=== train.train exited $rc, $(date), last ckpt: $(last_ckpt)"
 if [ "$rc" -eq 0 ] && [ "$SMOKE" != 1 ]; then
   date > "$OUTPUT_DIR/TRAIN_DONE"
