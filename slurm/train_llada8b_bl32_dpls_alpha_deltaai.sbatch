@@ -60,6 +60,9 @@ preempt_weaker() {  # a continuous batch job beats a 2h slice; more GPUs beat fe
   [ -n "$info" ] || return 0
   hp=${info%% *}; hw=${info##*:}
   [ "$hp" = ghx4-interactive ] && hw=0
+  # A scattered slice (..._scatter_deltaai.sbatch, job name *-sc) runs at 4-GPU speed in
+  # 2-hour pieces: a whole node beats it, the 2-GPU shape does not.
+  case "$(squeue -h -j "$holder" -o %j 2>/dev/null)" in *-sc) hw=3 ;; esac
   case "$hw" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$hw" -ge "$NG" ]; then
     # An equal or stronger batch job is already training this run and will finish it
