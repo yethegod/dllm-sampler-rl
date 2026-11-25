@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --account=bhta-dtai-gh
 #SBATCH --partition=ghx4
+#SBATCH --nodes=1
 #SBATCH --ntasks=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
@@ -9,11 +10,16 @@
 #SBATCH --job-name=llada8b-bl32-dpls-alpha-sc
 #SBATCH --output=slurm/logs/%x_%j.out
 
-# "Scattered" shape of the fixed-block alpha runs (see
-# train_llada8b_bl32_dpls_alpha_deltaai.sbatch): 4 single-GPU tasks wherever the cluster
-# has a free GPU, usually on 4 different nodes, for 2 hours. On a full ghx4 a whole node
-# (or two free GPUs on one node) is a day away, while single GPUs with <= ~36 GB of host
-# memory free up all the time and a 2-hour job backfills into them.
+# Short-slice shape of the fixed-block alpha runs (see
+# train_llada8b_bl32_dpls_alpha_deltaai.sbatch): 4 single-GPU srun tasks for 30 minutes.
+# On a full ghx4 a 48-hour (or even 2-hour) node is a day away, while a 30-minute job
+# backfills within the hour.
+#
+# --nodes=1 is deliberate. Without it Slurm 25.11 spread the job over two nodes with
+# 1 + 3 tasks but 2 + 2 GPUs (job 3678103), so two ranks landed on one GPU ("Duplicate
+# GPU detected"). The launcher itself is node-agnostic and probes the layout before
+# training, so `--nodes=2 --ntasks-per-node=2 --gpus-per-node=2` on the command line is a
+# valid alternative; a bare multi-node --ntasks=4 is not.
 #
 # The run itself is unchanged: 4 DDP ranks x per-device batch 32 = generation_batch_size
 # 128. Only the launcher differs: `accelerate launch` spawns its ranks on one node, so each
@@ -152,6 +158,16 @@ export WORLD_SIZE=$SLURM_NTASKS
 export TRAIN_CONFIG=$CONFIG TRAIN_OUT=$OUTPUT_DIR
 export TRAIN_EXTRA="${EXTRA[*]}"
 echo "ranks: $WORLD_SIZE, rendezvous $MASTER_ADDR:$MASTER_PORT"
+# Layout probe: a rank takes GPU (local rank mod visible GPUs), so every node must show
+# its tasks at least as many GPUs as it runs tasks. Fail in seconds, not after model load.
+if ! srun --ntasks="$SLURM_NTASKS" --gpus-per-task=1 --gpu-bind=none --cpus-per-task=8 \
+     --distribution=block bash -c '
+       n=$(echo "${CUDA_VISIBLE_DEVICES:-}" | tr "," "\n" | grep -c .)
+       echo "[probe] $(hostname -s) local rank $SLURM_LOCALID sees $n GPU(s)"
+       [ "$SLURM_LOCALID" -lt "$n" ]'; then
+  echo "=== task/GPU layout mismatch on $SLURM_JOB_NODELIST; not training in this slice."
+  exit 3
+fi
 srun --ntasks="$SLURM_NTASKS" --gpus-per-task=1 --gpu-bind=none --cpus-per-task=8 \
   --distribution=block --kill-on-bad-exit=1 bash -c '
     export RANK=$SLURM_PROCID LOCAL_RANK=$SLURM_LOCALID
