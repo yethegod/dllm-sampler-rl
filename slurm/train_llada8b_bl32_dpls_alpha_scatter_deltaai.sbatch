@@ -74,7 +74,7 @@ fi
 OUTPUT_DIR=$WORK/checkpoints/llada8b_bl32_a${A}_dpls
 CONFIG=configs/experiment_configs/llada_8b_instruct_dit_confidence_BL32_alpha${A}_dpls.yaml
 SELF=$REPO/slurm/train_llada8b_bl32_dpls_alpha_scatter_deltaai.sbatch
-EXTRA=(--save_steps 10)
+EXTRA=(--save_steps 5)   # a 30-minute slice loses at most ~4 min to its time limit
 if [ "$SMOKE" = 1 ]; then
   OUTPUT_DIR=$WORK/checkpoints/smoke_bl32_scatter
   EXTRA=(--max_steps 3 --save_steps 2 --warmup_steps 2)
