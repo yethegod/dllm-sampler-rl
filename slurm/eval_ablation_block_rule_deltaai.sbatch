@@ -44,8 +44,10 @@ RESULTS=${RESULTS:-$WORK/eval_results/ablation_block_rule}
 CFG=configs/experiment_configs
 JOINT_RUN=$WORK/checkpoints/llada8b_block_unmask_cond_v2_a1_dpls
 JOINT_CFG=$CFG/llada_8b_instruct_dit_block_unmask_joint_cond_v2_alpha1_dpls.yaml
-FIX_RUN=$WORK/checkpoints/llada8b_bl32_a1_dpls
-FIX_CFG=$CFG/llada_8b_instruct_dit_confidence_BL32_alpha1_dpls.yaml
+# FIX_RUN / FIX_CFG / RESULTS can be overridden to evaluate another fixed head with the F
+# cells, e.g. the alpha sweep llada8b_bl32_a{0p5,3}_dpls (slurm/logs/lup_bl32_alpha_chain.sh).
+FIX_RUN=${FIX_RUN:-$WORK/checkpoints/llada8b_bl32_a1_dpls}
+FIX_CFG=${FIX_CFG:-$CFG/llada_8b_instruct_dit_confidence_BL32_alpha1_dpls.yaml}
 
 module load python/miniforge3_pytorch
 eval "$(conda shell.bash hook)"
