@@ -1094,7 +1094,14 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=CustomDistributedSampler(dataset, shuffle=False),
+        # World size and rank come from the accelerator, not torch.distributed: a
+        # 1-GPU launch has no process group and dist.get_world_size() raises there.
+        sampler=CustomDistributedSampler(
+            dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False,
+        ),
         collate_fn=collate_fn,
     )
 
