@@ -225,7 +225,8 @@ rc=0
 for ((k = 0; k < ${#pids[@]}; k++)); do
   wait -n "${pids[@]}" || { rc=$?; kill "${pids[@]}" 2>/dev/null; break; }
 done
-wait
+# Only the steps: a bare `wait` would also wait for the lock heartbeat loop, i.e. forever.
+wait "${pids[@]}" 2>/dev/null
 echo "=== train.train exited $rc, $(date), last ckpt: $(last_ckpt)"
 if [ "$rc" -eq 0 ] && [ "$SMOKE" != 1 ]; then
   date > "$OUTPUT_DIR/TRAIN_DONE"
