@@ -1011,7 +1011,14 @@ class Trainer(GRPOTrainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         mode = "eval" if self.control.should_evaluate else "train"
         if mode == "train":
-            if self.state.global_step % self.num_iterations == 0:
+            # ``_buffered_inputs is None`` only on the first step after a resume from a
+            # checkpoint whose step is not a multiple of num_iterations: the rollouts it
+            # would reuse died with the previous process, so generate fresh ones for
+            # that one update instead of handing compute_loss ``None``.
+            if (
+                self.state.global_step % self.num_iterations == 0
+                or self._buffered_inputs is None
+            ):
                 # Generate new completions
                 inputs = self._generate_and_score_completions(inputs)
                 # Store for reuse in next num_iterations-1 steps

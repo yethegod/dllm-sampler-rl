@@ -131,18 +131,27 @@ export WANDB_RUN_ID=${WANDB_RUN_ID:-bl32-a${A}-dpls-v1}
 export WANDB_RESUME=allow
 export OMP_NUM_THREADS=8
 
-# A killed slice can leave a half-written last checkpoint behind.
-last=$(last_ckpt)
-if [ -n "$last" ]; then
+# Pick the checkpoint to resume from. Two kinds are moved aside: a half-written one (a
+# killed slice), and one whose step is not a multiple of num_iterations. Rollouts are
+# generated every num_iterations steps and reused in between, so resuming mid-cycle
+# cannot reuse them (train/trainer.py then generates fresh ones for that step); resuming
+# on the cycle boundary reproduces the uninterrupted run exactly and costs < save_steps.
+NUM_IT=$(sed -n 's/^num_iterations: *\([0-9]*\).*/\1/p' "$CONFIG"); NUM_IT=${NUM_IT:-1}
+while :; do
+  last=$(last_ckpt)
+  [ -n "$last" ] || break
   d=$OUTPUT_DIR/checkpoint-$last
-  if [ -f "$d/optimizer.pt" ] && [ -f "$d/scheduler.pt" ] && [ -f "$d/model.safetensors" ] \
-     && python -c 'import json,sys; json.load(open(sys.argv[1]))' "$d/trainer_state.json" 2>/dev/null; then
-    echo "resuming from checkpoint-$last"
-  else
+  if ! { [ -f "$d/optimizer.pt" ] && [ -f "$d/scheduler.pt" ] && [ -f "$d/model.safetensors" ] \
+         && python -c 'import json,sys; json.load(open(sys.argv[1]))' "$d/trainer_state.json" 2>/dev/null; }; then
     echo "checkpoint-$last is incomplete; moving it aside"
     mv "$d" "$OUTPUT_DIR/broken-checkpoint-$last-$SLURM_JOB_ID"
+  elif [ $((last % NUM_IT)) -ne 0 ]; then
+    echo "checkpoint-$last is mid rollout cycle (num_iterations $NUM_IT); moving it aside"
+    mv "$d" "$OUTPUT_DIR/midcycle-checkpoint-$last-$SLURM_JOB_ID"
+  else
+    echo "resuming from checkpoint-$last"; break
   fi
-fi
+done
 
 # torchrun's contract, by hand, with ranks placed by GPU rather than by Slurm task.
 # For a --gpus-per-task job Slurm lays out tasks (CPUs, memory) and GPUs independently:
